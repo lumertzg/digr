@@ -5,9 +5,10 @@ edition = "2024"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+data-encoding = "2.11.1"
 directories = "6.0.0"
 flate2 = "1.1.10"
-hickory-resolver = "0.26.3"
+hickory-resolver = { version = "0.26.3", features = ["dnssec-ring"] }
 indicatif = "0.18.6"
 ipnet = "2.12.2"
 maxminddb = "0.32.0"

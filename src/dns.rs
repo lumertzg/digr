@@ -29,6 +29,8 @@ pub struct Query {
     pub source: Option<IpAddr>,
     pub subnet: Option<ClientSubnet>,
     pub recursion: bool,
+    pub dnssec: bool,
+    pub checking_disabled: bool,
     pub timeout: Duration,
     /// Total attempts, including the initial request.
     pub tries: NonZeroUsize,
@@ -39,6 +41,66 @@ pub struct Response {
     pub tcp: bool,
     pub elapsed: Duration,
     pub message: DnsResponse,
+}
+
+/// An untrusted, server-reported Extended DNS Error (RFC 8914).
+pub struct ExtendedError<'a> {
+    pub code: Option<u16>,
+    pub name: Option<&'static str>,
+    pub text: Option<&'a str>,
+    pub wire: &'a [u8],
+}
+
+impl Response {
+    pub fn extended_errors(&self) -> impl Iterator<Item = ExtendedError<'_>> {
+        self.message
+            .edns
+            .iter()
+            .flat_map(|edns| &edns.options().options)
+            .filter_map(|(_, option)| {
+                let EdnsOption::Unknown(15, wire) = option else {
+                    return None;
+                };
+                let code = wire.first_chunk::<2>().copied().map(u16::from_be_bytes);
+                let name = match code {
+                    Some(0) => Some("Other"),
+                    Some(1) => Some("Unsupported DNSKEY Algorithm"),
+                    Some(2) => Some("Unsupported DS Digest Type"),
+                    Some(3) => Some("Stale Answer"),
+                    Some(4) => Some("Forged Answer"),
+                    Some(5) => Some("DNSSEC Indeterminate"),
+                    Some(6) => Some("DNSSEC Bogus"),
+                    Some(7) => Some("Signature Expired"),
+                    Some(8) => Some("Signature Not Yet Valid"),
+                    Some(9) => Some("DNSKEY Missing"),
+                    Some(10) => Some("RRSIGs Missing"),
+                    Some(11) => Some("No Zone Key Bit Set"),
+                    Some(12) => Some("NSEC Missing"),
+                    Some(13) => Some("Cached Error"),
+                    Some(14) => Some("Not Ready"),
+                    Some(15) => Some("Blocked"),
+                    Some(16) => Some("Censored"),
+                    Some(17) => Some("Filtered"),
+                    Some(18) => Some("Prohibited"),
+                    Some(19) => Some("Stale NXDOMAIN Answer"),
+                    Some(20) => Some("Not Authoritative"),
+                    Some(21) => Some("Not Supported"),
+                    Some(22) => Some("No Reachable Authority"),
+                    Some(23) => Some("Network Error"),
+                    Some(24) => Some("Invalid Data"),
+                    _ => None,
+                };
+
+                Some(ExtendedError {
+                    code,
+                    name,
+                    text: wire
+                        .get(2..)
+                        .and_then(|text| std::str::from_utf8(text).ok()),
+                    wire,
+                })
+            })
+    }
 }
 
 /// A nameserver address. A nonzero scope selects the interface of a link-local IPv6 server.
@@ -241,7 +303,9 @@ impl Query {
         let question = DnsQuery::query(self.name.clone(), self.record_type);
         let mut options = DnsRequestOptions::default();
         options.recursion_desired = self.recursion;
+        options.edns_set_dnssec_ok = self.dnssec;
         let mut request = DnsRequest::from_query(question.clone(), options);
+        request.metadata.checking_disabled = self.checking_disabled;
         if let Some(subnet) = self.subnet {
             request
                 .edns
@@ -250,7 +314,7 @@ impl Query {
                 .insert(EdnsOption::Subnet(subnet));
         }
 
-        let response = exchange.send(request).first_answer().await?;
+        let mut response = exchange.send(request).first_answer().await?;
 
         if response.metadata.op_code != OpCode::Query {
             return Err("response opcode does not match the query".into());
@@ -258,6 +322,13 @@ impl Query {
 
         if response.queries.as_slice() != std::slice::from_ref(&question) {
             return Err("response question does not match the query".into());
+        }
+
+        // Hickory separates TSIG when DNSSEC support is enabled. Keep it visible without verifying it.
+        if let Some(signature) = response.signature.take() {
+            response
+                .additionals
+                .push((*signature).into_record_of_rdata());
         }
 
         Ok(response)
@@ -457,6 +528,8 @@ mod tests {
             source: None,
             subnet: None,
             recursion: true,
+            dnssec: false,
+            checking_disabled: false,
             timeout: Duration::from_secs(1),
             tries: NonZeroUsize::MIN,
         }

@@ -36,6 +36,9 @@ struct QuerySummary {
     #[serde(rename = "type")]
     record_type: String,
     subnet: Option<String>,
+    dnssec: bool,
+    checking_disabled: bool,
+    local_validation: &'static str,
 }
 
 #[derive(Serialize)]
@@ -45,12 +48,29 @@ struct ResponseSummary {
     elapsed_ms: f64,
     status: String,
     flags: Flags,
+    edns: Option<EdnsSummary>,
     question: Question,
     answers: Vec<RecordSummary>,
     authority: Vec<RecordSummary>,
     additional: Vec<RecordSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hop: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct EdnsSummary {
+    version: u8,
+    udp_payload: u16,
+    dnssec_ok: bool,
+    extended_errors: Vec<ExtendedErrorSummary>,
+}
+
+#[derive(Serialize)]
+struct ExtendedErrorSummary {
+    code: Option<u16>,
+    name: Option<&'static str>,
+    text: Option<String>,
+    wire_hex: String,
 }
 
 #[derive(Serialize)]
@@ -138,6 +158,9 @@ impl Document {
                 subnet: query
                     .subnet
                     .map(|subnet| format!("{}/{}", subnet.addr(), subnet.source_prefix())),
+                dnssec: query.dnssec,
+                checking_disabled: query.checking_disabled,
+                local_validation: "not_performed",
             },
             responses: Vec::new(),
             complete: false,
@@ -183,6 +206,20 @@ impl Document {
                 authenticated_data: metadata.authentic_data,
                 checking_disabled: metadata.checking_disabled,
             },
+            edns: message.edns.as_ref().map(|edns| EdnsSummary {
+                version: edns.version(),
+                udp_payload: edns.max_payload(),
+                dnssec_ok: edns.flags().dnssec_ok,
+                extended_errors: response
+                    .extended_errors()
+                    .map(|error| ExtendedErrorSummary {
+                        code: error.code,
+                        name: error.name,
+                        text: error.text.map(str::to_owned),
+                        wire_hex: hex(error.wire),
+                    })
+                    .collect(),
+            }),
             question: Question {
                 name: question.name().to_ascii(),
                 record_type: record_type(question.query_type()),
@@ -285,10 +322,10 @@ fn record_data(data: &RData) -> Result<Value, Box<dyn Error>> {
         RData::TXT(txt) => json!({"strings": txt.txt_data.iter().map(|bytes| json!({
             "text": std::str::from_utf8(bytes).ok(), "hex": hex(bytes),
         })).collect::<Vec<_>>()}),
-        _ => json!({"text": super::record_value(data), "wire_hex": hex(&data.to_bytes()?)}),
+        _ => json!({"text": super::record_value(data, true), "wire_hex": hex(&data.to_bytes()?)}),
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

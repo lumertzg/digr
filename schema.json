@@ -10,11 +10,14 @@
     "query": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "type", "subnet"],
+      "required": ["name", "type", "subnet", "dnssec", "checking_disabled", "local_validation"],
       "properties": {
         "name": {"type": "string"},
         "type": {"type": "string"},
-        "subnet": {"type": ["string", "null"]}
+        "subnet": {"type": ["string", "null"]},
+        "dnssec": {"type": "boolean", "description": "Requested DO bit, not a validation result."},
+        "checking_disabled": {"type": "boolean", "description": "Requested CD bit."},
+        "local_validation": {"const": "not_performed"}
       }
     },
     "responses": {"type": "array", "items": {"$ref": "#/$defs/response"}},
@@ -82,16 +85,42 @@
     "uint16": {"type": "integer", "minimum": 0, "maximum": 65535},
     "uint32": {"type": "integer", "minimum": 0, "maximum": 4294967295},
     "hex": {"type": "string", "pattern": "^(?:[0-9a-f]{2})*$"},
+    "edns": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["version", "udp_payload", "dnssec_ok", "extended_errors"],
+      "properties": {
+        "version": {"type": "integer", "minimum": 0, "maximum": 255},
+        "udp_payload": {"$ref": "#/$defs/uint16"},
+        "dnssec_ok": {"type": "boolean"},
+        "extended_errors": {
+          "type": "array",
+          "description": "Server-reported diagnostics, not local validation results. Includes malformed options.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "name", "text", "wire_hex"],
+            "properties": {
+              "code": {"type": ["integer", "null"], "minimum": 0, "maximum": 65535},
+              "name": {"type": ["string", "null"]},
+              "text": {"type": ["string", "null"]},
+              "wire_hex": {"$ref": "#/$defs/hex"}
+            }
+          }
+        }
+      }
+    },
     "response": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["server", "transport", "elapsed_ms", "status", "flags", "question", "answers", "authority", "additional"],
+      "required": ["server", "transport", "elapsed_ms", "status", "flags", "edns", "question", "answers", "authority", "additional"],
       "properties": {
         "server": {"type": "string", "description": "Nameserver socket address (IP and port)."},
         "transport": {"enum": ["udp", "tcp"]},
         "elapsed_ms": {"type": "number", "minimum": 0},
         "status": {"type": "string"},
         "hop": {"type": "integer", "minimum": 1},
+        "edns": {"$ref": "#/$defs/edns"},
         "flags": {
           "type": "object",
           "additionalProperties": false,
