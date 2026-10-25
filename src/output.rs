@@ -1,21 +1,22 @@
 use std::env;
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
+use std::net::IpAddr;
 
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::Record;
+use hickory_resolver::proto::rr::rdata::HTTPS;
+use hickory_resolver::proto::rr::{DNSClass, RData, Record, RecordType};
 use indicatif::{ProgressBar, ProgressStyle};
 use tabled::builder::Builder;
 use tabled::grid::util::string::get_line_width;
 use tabled::settings::{
     Alignment, Color, Padding, Style, Width,
-    formatting::Charset,
     object::{Cell, Columns, Rows},
     style::BorderColor,
 };
 
 use crate::dns::{Query, Response};
-use crate::location::{Database, Kind};
+use crate::location::{Database, Information, Kind, Progress};
 use crate::trace::Hop;
 
 pub mod json;
@@ -89,7 +90,11 @@ fn print_lookup(responses: &[Response], verbose: bool, databases: &[Database]) -
             writeln!(io::stdout().lock())?;
         }
 
-        let title = format!("{} {}", question.name(), question.query_type());
+        let title = format!(
+            "{} {}",
+            question.name().to_ascii(),
+            record_type(question.query_type())
+        );
         print_response(response, &title, verbose, databases)?;
     }
 
@@ -97,10 +102,18 @@ fn print_lookup(responses: &[Response], verbose: bool, databases: &[Database]) -
 }
 
 fn print_records(records: &[Record], databases: &[Database]) -> io::Result<()> {
-    let mut builder = Builder::default();
     let enrich =
         !databases.is_empty() && records.iter().any(|record| record.data.ip_addr().is_some());
-    let mut header = vec!["Name", "Type", "TTL (s)", "Value"];
+    let show_class = records
+        .iter()
+        .any(|record| record.dns_class != DNSClass::IN);
+    let mut builder = Builder::default();
+
+    let mut header = vec!["Name", "Type"];
+    if show_class {
+        header.push("Class");
+    }
+    header.extend(["TTL (s)", "Value"]);
     if enrich {
         for database in databases {
             header.push(match database.kind {
@@ -112,34 +125,34 @@ fn print_records(records: &[Record], databases: &[Database]) -> io::Result<()> {
     builder.push_record(header);
 
     for record in records {
-        let mut row = vec![
-            record.name.to_string(),
-            record.data.record_type().to_string(),
-            record.ttl.to_string(),
-            record.data.to_string(),
-        ];
+        let mut row = vec![record.name.to_ascii(), record_type(record.record_type())];
+        if show_class {
+            row.push(record_class(record.dns_class));
+        }
+        row.extend([record.ttl.to_string(), record_value(&record.data)]);
+
         if enrich {
-            for database in databases {
-                let value = record.data.ip_addr().map(|ip| {
-                    database
-                        .lookup(ip)
-                        .unwrap_or_else(|error| {
-                            eprintln!("digr: {} lookup for {ip} failed: {error}", database.kind);
-                            None
-                        })
-                        .map(|information| information.to_string())
-                        .unwrap_or_else(|| "—".to_owned())
-                });
-                row.push(value.unwrap_or_else(|| "—".to_owned()));
+            let information = record
+                .data
+                .ip_addr()
+                .map(|ip| ip_information(databases, ip, |message| eprintln!("digr: {message}")));
+            for index in 0..databases.len() {
+                let value = information
+                    .as_ref()
+                    .and_then(|information| information[index].1.as_ref())
+                    .map_or_else(|| "—".to_owned(), ToString::to_string);
+                row.push(value);
             }
         }
-        builder.push_record(row);
+
+        builder.push_record(row.iter().map(|cell| escape(cell)));
     }
 
     let mut table = builder.build();
-    table.with((Style::sharp(), Charset::new().clean()));
+    let ttl_column = if show_class { 3 } else { 2 };
+    table.with(Style::sharp());
     table.with(Alignment::left());
-    table.modify(Columns::one(2), Alignment::right());
+    table.modify(Columns::one(ttl_column), Alignment::right());
 
     if let Some((terminal_size::Width(width), _)) = terminal_size::terminal_size_of(io::stdout())
         && table.total_width() > usize::from(width)
@@ -151,7 +164,7 @@ fn print_records(records: &[Record], databases: &[Database]) -> io::Result<()> {
         table.with(BorderColor::filled(Color::FG_BRIGHT_BLACK));
         table.modify(Columns::one(0), Color::FG_BRIGHT_BLACK);
         table.modify(Columns::one(1), Color::FG_CYAN);
-        table.modify(Columns::one(2), Color::FG_BRIGHT_BLACK);
+        table.modify(Columns::one(ttl_column), Color::FG_BRIGHT_BLACK);
         table.modify(Rows::first(), Color::FG_GREEN | Color::BOLD);
     }
 
@@ -193,7 +206,7 @@ fn print_stacked(rows: Vec<Vec<String>>, width: usize) -> io::Result<()> {
         }
 
         let mut table = builder.build();
-        table.with((Style::empty(), Charset::new().clean()));
+        table.with(Style::empty());
         if inline {
             table.with(Padding::new(0, 2, 0, 0));
             table.modify(Columns::one(1), Width::wrap(value_width).keep_words(true));
@@ -257,7 +270,7 @@ fn print_response(
         Color::FG_CYAN
     };
     let status = response_status(status);
-    print_line(&format!("{title} · {status}"), color | Color::BOLD)?;
+    print_line(&escape(&format!("{title} · {status}")), color | Color::BOLD)?;
     print_line(
         &format!(
             "Server {} · {} · {:.1} ms",
@@ -355,11 +368,19 @@ impl DownloadProgress {
         Self { kind, bar: None }
     }
 
-    pub fn update(&mut self, length: Option<u64>, received: u64) {
-        let bar = self
-            .bar
-            .get_or_insert_with(|| download_progress(self.kind, length));
-        bar.set_position(received);
+    pub fn update(&mut self, progress: Progress) {
+        match progress {
+            Progress::Waiting => eprintln!(
+                "digr: waiting for another digr process to install DB-IP {} Lite…",
+                self.kind
+            ),
+            Progress::Download { length, received } => {
+                let bar = self
+                    .bar
+                    .get_or_insert_with(|| download_progress(self.kind, length));
+                bar.set_position(received);
+            }
+        }
     }
 }
 
@@ -427,4 +448,170 @@ fn colors_enabled() -> bool {
     io::stdout().is_terminal()
         && env::var_os("NO_COLOR").is_none()
         && env::var_os("TERM").is_none_or(|term| term != "dumb")
+}
+
+/// Looks up an address in each database, in order. A failed lookup is reported and yields
+/// no information.
+fn ip_information(
+    databases: &[Database],
+    ip: IpAddr,
+    mut warn: impl FnMut(String),
+) -> Vec<(Kind, Option<Information>)> {
+    databases
+        .iter()
+        .map(|database| {
+            let information = database.lookup(ip).unwrap_or_else(|error| {
+                warn(format!("{} lookup for {ip} failed: {error}", database.kind));
+                None
+            });
+            (database.kind, information)
+        })
+        .collect()
+}
+
+fn record_type(kind: RecordType) -> String {
+    match kind {
+        RecordType::Unknown(code) => format!("TYPE{code}"),
+        _ => kind.to_string(),
+    }
+}
+
+fn record_class(class: DNSClass) -> String {
+    match class {
+        DNSClass::Unknown(code) => format!("CLASS{code}"),
+        _ => class.to_string(),
+    }
+}
+
+/// Renders names in ASCII so lookalike Unicode domains stay distinguishable.
+fn record_value(data: &RData) -> String {
+    match data {
+        RData::ANAME(name) => name.0.to_ascii(),
+        RData::CNAME(name) => name.0.to_ascii(),
+        RData::NS(name) => name.0.to_ascii(),
+        RData::PTR(name) => name.0.to_ascii(),
+        RData::MX(mx) => format!("{} {}", mx.preference, mx.exchange.to_ascii()),
+        RData::HTTPS(HTTPS(svcb)) | RData::SVCB(svcb) => {
+            let mut text = format!("{} {}", svcb.svc_priority, svcb.target_name.to_ascii());
+            for (key, value) in &svcb.svc_params {
+                text.push_str(&format!(" {key}={value}"));
+            }
+            text
+        }
+        RData::NAPTR(naptr) => format!(
+            "{} {} {} {} {} {}",
+            naptr.order,
+            naptr.preference,
+            txt_string(&naptr.flags),
+            txt_string(&naptr.services),
+            txt_string(&naptr.regexp),
+            naptr.replacement.to_ascii()
+        ),
+        RData::SRV(srv) => format!(
+            "{} {} {} {}",
+            srv.priority,
+            srv.weight,
+            srv.port,
+            srv.target.to_ascii()
+        ),
+        // RFC 1035 timers are unsigned, though hickory stores some as i32.
+        RData::SOA(soa) => format!(
+            "{} {} {} {} {} {} {}",
+            soa.mname.to_ascii(),
+            soa.rname.to_ascii(),
+            soa.serial,
+            soa.refresh.cast_unsigned(),
+            soa.retry.cast_unsigned(),
+            soa.expire.cast_unsigned(),
+            soa.minimum
+        ),
+        RData::TXT(txt) => txt
+            .txt_data
+            .iter()
+            .map(|bytes| txt_string(bytes))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => data.to_string(),
+    }
+}
+
+/// Quotes a TXT character-string like zone files do, escaping bytes that are not safe text.
+fn txt_string(bytes: &[u8]) -> String {
+    let mut text = String::from('"');
+
+    for chunk in bytes.utf8_chunks() {
+        for character in chunk.valid().chars() {
+            match character {
+                '"' | '\\' => {
+                    text.push('\\');
+                    text.push(character);
+                }
+                _ if is_unsafe(character) => {
+                    for byte in character.encode_utf8(&mut [0; 4]).bytes() {
+                        text.push_str(&format!("\\{byte:03}"));
+                    }
+                }
+                _ => text.push(character),
+            }
+        }
+        for byte in chunk.invalid() {
+            text.push_str(&format!("\\{byte:03}"));
+        }
+    }
+
+    text.push('"');
+    text
+}
+
+/// DNS data is untrusted. Control characters could move the cursor or inject terminal
+/// escape sequences. Bidirectional overrides and invisible format characters could reorder
+/// or hide what is displayed.
+fn escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+
+    for character in text.chars() {
+        if is_unsafe(character) {
+            escaped.push_str(&format!("\\u{{{:x}}}", u32::from(character)));
+        } else {
+            escaped.push(character);
+        }
+    }
+
+    escaped
+}
+
+fn is_unsafe(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_neutralizes_terminal_control() {
+        assert_eq!(
+            escape("a\nb\u{1b}[2J\u{9b}\u{7f}\u{202e}"),
+            "a\\u{a}b\\u{1b}[2J\\u{9b}\\u{7f}\\u{202e}"
+        );
+    }
+
+    #[test]
+    fn txt_strings_are_quoted_and_escaped() {
+        assert_eq!(txt_string(b"say \"hi\"\n"), r#""say \"hi\"\010""#);
+        assert_eq!(txt_string(b"\xff caf\xc3\xa9"), r#""\255 café""#);
+    }
 }

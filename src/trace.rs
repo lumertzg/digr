@@ -1,66 +1,85 @@
+use std::net::IpAddr;
+
 use hickory_resolver::net::NetError;
 use hickory_resolver::proto::op::{DnsResponse, ResponseCode};
 use hickory_resolver::proto::rr::{DNSClass, Name, RData};
 
-use crate::dns::{Query, Response, parse_ip};
+use crate::dns::{Nameserver, Query, Response, is_server_failure};
 
 pub struct Hop {
     pub number: usize,
     pub response: Response,
 }
 
+/// A server to ask next: a known address, or a nameserver name without usable glue.
+#[derive(PartialEq)]
+enum Server {
+    Address(Nameserver),
+    Host(Name),
+}
+
 pub struct Trace {
     query: Query,
-    servers: Vec<String>,
+    servers: Vec<Server>,
     zone: Name,
     hop: Option<Hop>,
     work_left: usize,
 }
 
+const START_HINT: &str = "--trace --server needs a server that answers non-recursive queries, \
+                          such as a root or TLD server";
+
 impl Trace {
-    pub fn new(mut query: Query) -> Self {
+    pub fn new(mut query: Query) -> Result<Self, NetError> {
         query.name.set_fqdn(true);
         query.recursion = false;
         let servers = match &query.server {
-            Some(server) => vec![server.clone()],
+            Some(server) => vec![match Nameserver::parse(server)? {
+                Some(address) => Server::Address(address),
+                None => Server::Host(server.parse()?),
+            }],
             None => ROOT_SERVERS
                 .iter()
-                .map(|server| (*server).to_owned())
+                .map(|ip| Server::Address(ip.parse::<IpAddr>().expect("valid root hint").into()))
                 .collect(),
         };
 
-        Self {
+        Ok(Self {
             query,
             servers,
             zone: Name::root(),
             hop: None,
             work_left: 64,
-        }
+        })
     }
 
     /// Returns error-status responses before reporting their error on the next call.
     /// Stop iterating after an error.
     pub async fn next(&mut self) -> Result<Option<&Hop>, NetError> {
         if let Some(hop) = &self.hop {
-            if hop.response.message.metadata.response_code != ResponseCode::NoError {
-                return Err(format!(
+            let message = &hop.response.message;
+            if message.metadata.response_code != ResponseCode::NoError {
+                let mut error = format!(
                     "trace received {} from {}",
-                    hop.response.message.metadata.response_code, hop.response.server
-                )
-                .into());
+                    message.metadata.response_code, hop.response.server
+                );
+                if self.is_explicit_start(hop.number) && is_server_failure(message) {
+                    error = format!("{error} ({START_HINT})");
+                }
+                return Err(error.into());
             }
 
-            if hop.response.message.metadata.authoritative {
+            if message.metadata.authoritative {
                 return Ok(None);
             }
-
-            let (zone, servers) = self.referral_servers(&hop.response.message)?;
-            self.zone = zone;
-            self.servers = servers;
 
             if hop.number >= 32 {
                 return Err("trace hop limit exceeded".into());
             }
+
+            let zone = self.referral_zone(message)?.clone();
+            self.servers = self.referral_servers(message, &zone);
+            self.zone = zone;
         }
 
         self.hop = Some(self.send().await?);
@@ -68,66 +87,76 @@ impl Trace {
         Ok(self.hop.as_ref())
     }
 
+    /// Recursive resolvers fail non-recursive queries, a common mistake with --server.
+    fn is_explicit_start(&self, hop: usize) -> bool {
+        hop == 1 && self.query.server.is_some()
+    }
+
     async fn send(&mut self) -> Result<Hop, NetError> {
         let mut last_error = NetError::from("no nameservers match the requested transport family");
         let mut failure = None;
+        let servers = std::mem::take(&mut self.servers);
 
-        for index in 0..self.servers.len() {
-            if parse_ip(&self.servers[index], 0)
-                .ok()
-                .flatten()
-                .is_some_and(|server| !self.query.supports_family(server.ip()))
-            {
-                continue;
-            }
-
-            self.spend_work()?;
-            let addresses = match self.query.nameserver_addrs(&self.servers[index]).await {
-                Ok(addresses) => addresses,
-                Err(error) => {
-                    last_error = error;
-                    continue;
+        for server in &servers {
+            let addresses = match server {
+                Server::Address(address) => vec![*address],
+                Server::Host(name) => {
+                    self.spend_work()?;
+                    match self.query.resolve_host(name).await {
+                        Ok(addresses) => addresses,
+                        Err(error) => {
+                            last_error = error;
+                            continue;
+                        }
+                    }
                 }
             };
 
-            for server in addresses {
-                if !self.query.supports_family(server.ip()) {
+            for address in addresses {
+                if !self.query.supports_family(address.ip) {
                     continue;
                 }
 
                 self.spend_work()?;
+                let server = address.socket_addr(self.query.port.get());
                 let response = match self.query.request(server).await {
-                    Ok(result) => result,
+                    Ok(response) => response,
                     Err(error) => {
                         last_error = error;
                         continue;
                     }
                 };
-                let hop = Hop {
-                    number: self.hop.as_ref().map_or(1, |hop| hop.number + 1),
-                    response,
-                };
 
-                if matches!(
-                    hop.response.message.metadata.response_code,
-                    ResponseCode::ServFail | ResponseCode::Refused
-                ) {
-                    failure = Some(hop);
+                if is_server_failure(&response.message) {
+                    failure = Some(response);
                     continue;
                 }
 
-                if hop.response.message.metadata.response_code == ResponseCode::NoError
-                    && let Err(error) = self.validate_response(&hop.response.message)
+                if response.message.metadata.response_code == ResponseCode::NoError
+                    && let Err(error) = self.validate_response(&response.message)
                 {
-                    last_error = format!("{server}: {error}").into();
+                    let number = self.hop.as_ref().map_or(1, |hop| hop.number + 1);
+                    last_error = if self.is_explicit_start(number) {
+                        format!("{server}: {error} ({START_HINT})")
+                    } else {
+                        format!("{server}: {error}")
+                    }
+                    .into();
                     continue;
                 }
 
-                return Ok(hop);
+                return Ok(self.hop(response));
             }
         }
 
-        failure.ok_or(last_error)
+        failure.map(|response| self.hop(response)).ok_or(last_error)
+    }
+
+    fn hop(&self, response: Response) -> Hop {
+        Hop {
+            number: self.hop.as_ref().map_or(1, |hop| hop.number + 1),
+            response,
+        }
     }
 
     fn validate_response(&self, response: &DnsResponse) -> Result<(), NetError> {
@@ -137,14 +166,14 @@ impl Trace {
 
         // Authoritative NODATA ends the walk. A positive answer must concern this query.
         if !response.answers.is_empty() {
-            self.query.cname_target(response)?;
+            self.query.answer(response)?;
         }
 
         Ok(())
     }
 
     fn spend_work(&mut self) -> Result<(), NetError> {
-        // Bound both hostname bootstrap and server attempts across the entire walk.
+        // Bound both hostname lookups and server attempts across the entire walk.
         self.work_left = self
             .work_left
             .checked_sub(1)
@@ -173,8 +202,7 @@ impl Trace {
             .ok_or_else(|| "trace received an invalid or non-progressing referral".into())
     }
 
-    fn referral_servers(&self, response: &DnsResponse) -> Result<(Name, Vec<String>), NetError> {
-        let zone = self.referral_zone(response)?;
+    fn referral_servers(&self, response: &DnsResponse, zone: &Name) -> Vec<Server> {
         let mut servers = Vec::new();
 
         for record in &response.authorities {
@@ -187,30 +215,30 @@ impl Trace {
             };
             let mut has_glue = false;
 
-            // Only trust glue for named servers inside the delegated zone.
-            if zone.zone_of(&nameserver.0) {
+            // Only trust glue within the zone the referring server is authoritative for.
+            if self.zone.zone_of(&nameserver.0) {
                 for glue in &response.additionals {
                     if glue.dns_class == DNSClass::IN
                         && glue.name == nameserver.0
                         && let Some(ip) = glue.data.ip_addr()
                         && self.query.supports_family(ip)
                     {
-                        push_server(&mut servers, ip.to_string());
+                        push_server(&mut servers, Server::Address(ip.into()));
                         has_glue = true;
                     }
                 }
             }
 
             if !has_glue {
-                push_server(&mut servers, nameserver.0.to_string());
+                push_server(&mut servers, Server::Host(nameserver.0.clone()));
             }
         }
 
-        Ok((zone.clone(), servers))
+        servers
     }
 }
 
-fn push_server(servers: &mut Vec<String>, server: String) {
+fn push_server(servers: &mut Vec<Server>, server: Server) {
     if servers.len() < 64 && !servers.contains(&server) {
         servers.push(server);
     }

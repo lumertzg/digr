@@ -40,7 +40,7 @@
         "additionalProperties": false,
         "required": ["code", "message"],
         "properties": {
-          "code": {"enum": ["enrichment_unavailable", "enrichment_lookup_failed"]},
+          "code": {"enum": ["enrichment_unavailable", "enrichment_lookup_failed", "enrichment_update_failed"]},
           "message": {"type": "string"}
         }
       }
@@ -81,7 +81,6 @@
   "$defs": {
     "uint16": {"type": "integer", "minimum": 0, "maximum": 65535},
     "uint32": {"type": "integer", "minimum": 0, "maximum": 4294967295},
-    "int32": {"type": "integer", "minimum": -2147483648, "maximum": 2147483647},
     "hex": {"type": "string", "pattern": "^(?:[0-9a-f]{2})*$"},
     "response": {
       "type": "object",
@@ -196,9 +195,9 @@
               "mname": {"type": "string"},
               "rname": {"type": "string"},
               "serial": {"$ref": "#/$defs/uint32"},
-              "refresh": {"$ref": "#/$defs/int32"},
-              "retry": {"$ref": "#/$defs/int32"},
-              "expire": {"$ref": "#/$defs/int32"},
+              "refresh": {"$ref": "#/$defs/uint32"},
+              "retry": {"$ref": "#/$defs/uint32"},
+              "expire": {"$ref": "#/$defs/uint32"},
               "minimum": {"$ref": "#/$defs/uint32"}
             }
           }}}
