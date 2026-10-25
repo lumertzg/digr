@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "digr JSON output, version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mode", "query", "responses", "complete", "error", "warnings"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "mode": {"enum": ["lookup", "trace"]},
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "subnet"],
+      "properties": {
+        "name": {"type": "string"},
+        "type": {"type": "string"},
+        "subnet": {"type": ["string", "null"]}
+      }
+    },
+    "responses": {"type": "array", "items": {"$ref": "#/$defs/response"}},
+    "complete": {"type": "boolean"},
+    "error": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message"],
+          "properties": {
+            "code": {"const": "lookup_failed"},
+            "message": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message"],
+        "properties": {
+          "code": {"enum": ["enrichment_unavailable", "enrichment_lookup_failed"]},
+          "message": {"type": "string"}
+        }
+      }
+    },
+    "enrichment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "url", "license", "approximate", "databases"],
+      "properties": {
+        "provider": {"const": "DB-IP Lite"},
+        "url": {"const": "https://db-ip.com"},
+        "license": {"const": "CC BY 4.0"},
+        "approximate": {"const": true},
+        "databases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "build_date"],
+            "properties": {
+              "kind": {"enum": ["city", "asn"]},
+              "build_date": {"type": ["string", "null"], "format": "date"}
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [{
+    "if": {"properties": {"mode": {"const": "trace"}}},
+    "then": {"properties": {"responses": {"items": {"required": ["hop"]}}}},
+    "else": {"properties": {"responses": {"items": {"not": {"required": ["hop"]}}}}}
+  }, {
+    "if": {"properties": {"complete": {"const": true}}},
+    "then": {"properties": {"error": {"type": "null"}}},
+    "else": {"properties": {"error": {"type": "object"}}}
+  }],
+  "$defs": {
+    "uint16": {"type": "integer", "minimum": 0, "maximum": 65535},
+    "uint32": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+    "int32": {"type": "integer", "minimum": -2147483648, "maximum": 2147483647},
+    "hex": {"type": "string", "pattern": "^(?:[0-9a-f]{2})*$"},
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server", "transport", "elapsed_ms", "status", "flags", "question", "answers", "authority", "additional"],
+      "properties": {
+        "server": {"type": "string", "description": "Nameserver socket address (IP and port)."},
+        "transport": {"enum": ["udp", "tcp"]},
+        "elapsed_ms": {"type": "number", "minimum": 0},
+        "status": {"type": "string"},
+        "hop": {"type": "integer", "minimum": 1},
+        "flags": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authoritative", "truncated", "recursion_desired", "recursion_available", "authenticated_data", "checking_disabled"],
+          "properties": {
+            "authoritative": {"type": "boolean"},
+            "truncated": {"type": "boolean"},
+            "recursion_desired": {"type": "boolean"},
+            "recursion_available": {"type": "boolean"},
+            "authenticated_data": {"type": "boolean"},
+            "checking_disabled": {"type": "boolean"}
+          }
+        },
+        "question": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "type", "class"],
+          "properties": {
+            "name": {"type": "string"},
+            "type": {"type": "string"},
+            "class": {"type": "string"}
+          }
+        },
+        "answers": {"$ref": "#/$defs/records"},
+        "authority": {"$ref": "#/$defs/records"},
+        "additional": {"$ref": "#/$defs/records"}
+      }
+    },
+    "records": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "class", "ttl", "data"],
+      "properties": {
+        "name": {"type": "string"},
+        "type": {"type": "string"},
+        "class": {"type": "string"},
+        "ttl": {"$ref": "#/$defs/uint32"},
+        "data": {"type": "object"},
+        "location": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["city", "country_code"],
+          "properties": {
+            "city": {"type": ["string", "null"]},
+            "country_code": {"type": ["string", "null"]}
+          }
+        },
+        "asn": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["number", "organization"],
+          "properties": {
+            "number": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+            "organization": {"type": ["string", "null"]}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"enum": ["A", "AAAA"]}}},
+          "then": {"properties": {"data": {
+            "additionalProperties": false,
+            "required": ["address"],
+            "properties": {"address": {"type": "string"}}
+          }}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "A"}}},
+          "then": {"properties": {"data": {"properties": {"address": {"format": "ipv4"}}}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "AAAA"}}},
+          "then": {"properties": {"data": {"properties": {"address": {"format": "ipv6"}}}}}
+        },
+        {
+          "if": {"properties": {"type": {"enum": ["NS", "CNAME", "PTR", "ANAME"]}}},
+          "then": {"properties": {"data": {
+            "additionalProperties": false,
+            "required": ["target"],
+            "properties": {"target": {"type": "string"}}
+          }}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "MX"}}},
+          "then": {"properties": {"data": {
+            "additionalProperties": false,
+            "required": ["preference", "exchange"],
+            "properties": {
+              "preference": {"$ref": "#/$defs/uint16"},
+              "exchange": {"type": "string"}
+            }
+          }}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "SOA"}}},
+          "then": {"properties": {"data": {
+            "additionalProperties": false,
+            "required": ["mname", "rname", "serial", "refresh", "retry", "expire", "minimum"],
+            "properties": {
+              "mname": {"type": "string"},
+              "rname": {"type": "string"},
+              "serial": {"$ref": "#/$defs/uint32"},
+              "refresh": {"$ref": "#/$defs/int32"},
+              "retry": {"$ref": "#/$defs/int32"},
+              "expire": {"$ref": "#/$defs/int32"},
+              "minimum": {"$ref": "#/$defs/uint32"}
+            }
+          }}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "SRV"}}},
+          "then": {"properties": {"data": {
+            "additionalProperties": false,
+            "required": ["priority", "weight", "port", "target"],
+            "properties": {
+              "priority": {"$ref": "#/$defs/uint16"},
+              "weight": {"$ref": "#/$defs/uint16"},
+              "port": {"$ref": "#/$defs/uint16"},
+              "target": {"type": "string"}
+            }
+          }}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "TXT"}}},
+          "then": {"properties": {"data": {
+            "additionalProperties": false,
+            "required": ["strings"],
+            "properties": {"strings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text", "hex"],
+                "properties": {
+                  "text": {"type": ["string", "null"]},
+                  "hex": {"$ref": "#/$defs/hex"}
+                }
+              }
+            }}
+          }}}
+        },
+        {
+          "if": {"properties": {"type": {"not": {"enum": ["A", "AAAA", "NS", "CNAME", "PTR", "ANAME", "MX", "SOA", "SRV", "TXT"]}}}},
+          "then": {"properties": {"data": {
+            "additionalProperties": false,
+            "required": ["text", "wire_hex"],
+            "properties": {
+              "text": {"type": "string"},
+              "wire_hex": {"$ref": "#/$defs/hex"}
+            }
+          }}}
+        }
+      ]
+    }
+  }
+}
