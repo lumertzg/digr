@@ -7,7 +7,7 @@ use hickory_resolver::proto::rr::{Name, RecordType};
 use ipnet::IpNet;
 use usage_rs::{Cli, Subcommands, ValidationError};
 
-use crate::dns::Query;
+use crate::dns::{Query, parse_ip};
 use crate::location::Kind;
 
 /// Query DNS records.
@@ -140,14 +140,21 @@ impl TryFrom<QueryArgs> for Command {
                 .reason("must match the requested transport family"));
         }
 
-        if let Some(server) = &args.server
-            && server.parse::<IpAddr>().is_err()
-        {
-            server.parse::<Name>().map_err(|error| {
+        if let Some(server) = &args.server {
+            let invalid = |reason: String| {
                 ValidationError::field("--server")
                     .value(server)
-                    .reason(error.to_string())
-            })?;
+                    .reason(reason)
+            };
+
+            if parse_ip(server, 53)
+                .map_err(|error| invalid(error.to_string()))?
+                .is_none()
+            {
+                server
+                    .parse::<Name>()
+                    .map_err(|error| invalid(error.to_string()))?;
+            }
         }
 
         let subnet = args
