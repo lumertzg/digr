@@ -1,10 +1,8 @@
-use std::net::{IpAddr, SocketAddr};
-
 use hickory_resolver::net::NetError;
 use hickory_resolver::proto::op::{DnsResponse, ResponseCode};
 use hickory_resolver::proto::rr::{DNSClass, Name, RData};
 
-use crate::dns::{Query, Response};
+use crate::dns::{Query, Response, parse_ip};
 
 pub struct Hop {
     pub number: usize,
@@ -75,15 +73,16 @@ impl Trace {
         let mut failure = None;
 
         for index in 0..self.servers.len() {
-            if self.servers[index]
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| !self.query.supports_family(ip))
+            if parse_ip(&self.servers[index], 0)
+                .ok()
+                .flatten()
+                .is_some_and(|server| !self.query.supports_family(server.ip()))
             {
                 continue;
             }
 
             self.spend_work()?;
-            let addresses = match self.query.nameserver_ips(&self.servers[index]).await {
+            let addresses = match self.query.nameserver_addrs(&self.servers[index]).await {
                 Ok(addresses) => addresses,
                 Err(error) => {
                     last_error = error;
@@ -91,13 +90,12 @@ impl Trace {
                 }
             };
 
-            for ip in addresses {
-                if !self.query.supports_family(ip) {
+            for server in addresses {
+                if !self.query.supports_family(server.ip()) {
                     continue;
                 }
 
                 self.spend_work()?;
-                let server = SocketAddr::new(ip, self.query.port.get());
                 let response = match self.query.request(server).await {
                     Ok(result) => result,
                     Err(error) => {
