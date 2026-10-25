@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use chrono::{Months, Utc};
+use chrono::{DateTime, Months, Utc};
 use directories::ProjectDirs;
 use flate2::read::GzDecoder;
 use maxminddb::{Reader, geoip2};
@@ -16,8 +16,16 @@ use tempfile::NamedTempFile;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const MAX_AGE: i64 = 30 * 24 * 60 * 60;
 const RETRY_INTERVAL: i64 = 24 * 60 * 60;
+
+pub enum Progress {
+    /// Another process holds the install lock.
+    Waiting,
+    Download {
+        length: Option<u64>,
+        received: u64,
+    },
+}
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -96,37 +104,35 @@ impl std::fmt::Display for Information {
 }
 
 impl Database {
-    pub async fn load(kind: Kind, progress: impl FnMut(Option<u64>, u64)) -> Result<Self> {
-        let directory = cache_directory()?;
-        let path = directory.join(format!("dbip-{kind}-lite.mmdb"));
-        let state_path = path.with_extension("state");
+    pub async fn load(kind: Kind, mut progress: impl FnMut(Progress)) -> Result<Self> {
+        let (path, state_path) = paths(kind)?;
+        if let Ok(reader) = open(&path, kind) {
+            return Ok(Self { kind, reader });
+        }
+
+        let lock = state_file(&state_path)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                progress(Progress::Waiting);
+                lock.lock()?;
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+
+        // Another first-use process may have installed the database while we waited.
+        // A first install is user-requested, so unlike background refreshes it is not rate-limited.
         let reader = match open(&path, kind) {
             Ok(reader) => reader,
-            Err(_) => {
-                let mut lock = state_file(&state_path)?;
-                lock.lock()?;
-
-                // Another first-use process may have installed the database while we waited.
-                match open(&path, kind) {
-                    Ok(reader) => reader,
-                    Err(_) => {
-                        if !begin_attempt(&mut lock)? {
-                            return Err(
-                                "database installation already attempted within the last day"
-                                    .into(),
-                            );
-                        }
-                        install(&path, kind, progress).await?
-                    }
-                }
-            }
+            Err(_) => install(&path, kind, &release_months(None, Utc::now()), progress).await?,
         };
 
         Ok(Self { kind, reader })
     }
 
     pub fn refresh_if_stale(&self) -> Result<()> {
-        let state_path = cache_directory()?.join(format!("dbip-{}-lite.state", self.kind));
+        let (_, state_path) = paths(self.kind)?;
+
         if stale(&self.reader)
             && !fs::read_to_string(&state_path).is_ok_and(|value| recent_attempt(&value))
         {
@@ -146,8 +152,7 @@ impl Database {
     }
 
     pub fn build_date(&self) -> Option<String> {
-        chrono::DateTime::from_timestamp(self.reader.metadata().build_epoch as i64, 0)
-            .map(|date| date.format("%Y-%m-%d").to_string())
+        build_time(&self.reader).map(|date| date.format("%Y-%m-%d").to_string())
     }
 
     pub fn lookup(&self, ip: IpAddr) -> Result<Option<Information>> {
@@ -173,8 +178,7 @@ impl Database {
 }
 
 pub async fn update(kind: Kind) -> Result<()> {
-    let path = cache_directory()?.join(format!("dbip-{kind}-lite.mmdb"));
-    let state_path = path.with_extension("state");
+    let (path, state_path) = paths(kind)?;
     let mut lock = state_file(&state_path)?;
 
     match lock.try_lock() {
@@ -183,13 +187,24 @@ pub async fn update(kind: Kind) -> Result<()> {
         Err(TryLockError::Error(error)) => return Err(error.into()),
     }
 
-    if !stale(&open(&path, kind)?) || !begin_attempt(&mut lock)? {
+    let installed = open(&path, kind).ok();
+    if installed.as_ref().is_some_and(|reader| !stale(reader)) || !begin_attempt(&mut lock)? {
         return Ok(());
     }
 
-    install(&path, kind, |_, _| {}).await?;
+    let installed = installed.as_ref().map(release_month);
+    let months = release_months(installed.as_deref(), Utc::now());
+    install(&path, kind, &months, |_| {}).await?;
 
     Ok(())
+}
+
+/// Returns the database and its lock and state file.
+fn paths(kind: Kind) -> Result<(PathBuf, PathBuf)> {
+    let path = cache_directory()?.join(format!("dbip-{kind}-lite.mmdb"));
+    let state_path = path.with_extension("state");
+
+    Ok((path, state_path))
 }
 
 fn cache_directory() -> Result<PathBuf> {
@@ -209,11 +224,30 @@ fn state_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+fn build_time(reader: &Reader<Vec<u8>>) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(reader.metadata().build_epoch as i64, 0)
+}
+
+/// DB-IP builds each monthly release on its first day, so the build month names the release.
+fn release_month(reader: &Reader<Vec<u8>>) -> String {
+    build_time(reader)
+        .map(|date| date.format("%Y-%m").to_string())
+        .unwrap_or_default()
+}
+
+/// A newer monthly release may exist once the calendar passes the installed release's month.
 fn stale(reader: &Reader<Vec<u8>>) -> bool {
-    Utc::now()
-        .timestamp()
-        .saturating_sub(reader.metadata().build_epoch as i64)
-        > MAX_AGE
+    release_month(reader) < Utc::now().format("%Y-%m").to_string()
+}
+
+/// Release months newer than the installed one, newest first. Publication may lag the
+/// calendar, so the previous month is a fallback.
+fn release_months(installed: Option<&str>, now: DateTime<Utc>) -> Vec<String> {
+    [now, now - Months::new(1)]
+        .iter()
+        .map(|date| date.format("%Y-%m").to_string())
+        .filter(|month| installed.is_none_or(|installed| month.as_str() > installed))
+        .collect()
 }
 
 fn recent_attempt(value: &str) -> bool {
@@ -256,7 +290,10 @@ fn start_updater(kind: Kind) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x00000008 | 0x00000200);
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
     let mut child = command.spawn()?;
@@ -268,7 +305,8 @@ fn start_updater(kind: Kind) -> io::Result<()> {
 }
 
 fn open(path: &Path, kind: Kind) -> Result<Reader<Vec<u8>>> {
-    let reader = Reader::open_readfile(path)?;
+    let reader = Reader::open_readfile(path)
+        .map_err(|error| format!("opening {}: {error}", path.display()))?;
     if !reader
         .metadata()
         .database_type
@@ -288,7 +326,8 @@ fn open(path: &Path, kind: Kind) -> Result<Reader<Vec<u8>>> {
 async fn install(
     path: &Path,
     kind: Kind,
-    mut progress: impl FnMut(Option<u64>, u64),
+    months: &[String],
+    mut progress: impl FnMut(Progress),
 ) -> Result<Reader<Vec<u8>>> {
     let client = Client::builder()
         .user_agent(concat!("digr/", env!("CARGO_PKG_VERSION")))
@@ -296,15 +335,11 @@ async fn install(
         .timeout(Duration::from_secs(300))
         .https_only(true)
         .build()?;
-    let now = Utc::now();
     let mut response = None;
 
-    // Monthly publication may lag the calendar, so try the previous release on 404 only.
-    for date in [now, now - Months::new(1)] {
-        let url = format!(
-            "https://download.db-ip.com/free/dbip-{kind}-lite-{}.mmdb.gz",
-            date.format("%Y-%m")
-        );
+    // Try older releases on 404 only.
+    for month in months {
+        let url = format!("https://download.db-ip.com/free/dbip-{kind}-lite-{month}.mmdb.gz");
         let candidate = client.get(url).send().await?;
         if candidate.status() != StatusCode::NOT_FOUND {
             response = Some(candidate.error_for_status()?);
@@ -312,16 +347,23 @@ async fn install(
         }
     }
 
-    let mut response = response.ok_or("current and previous monthly releases are unavailable")?;
+    let mut response = response.ok_or("no new monthly release is available yet")?;
     let length = response.content_length();
-    progress(length, 0);
     let mut compressed = Vec::new();
+    progress(Progress::Download {
+        length,
+        received: 0,
+    });
+
     while let Some(chunk) = response.chunk().await? {
         if compressed.len() + chunk.len() > 256 * 1024 * 1024 {
             return Err("database download exceeds 256 MiB".into());
         }
         compressed.extend_from_slice(&chunk);
-        progress(length, compressed.len() as u64);
+        progress(Progress::Download {
+            length,
+            received: compressed.len() as u64,
+        });
     }
 
     let mut file = NamedTempFile::new_in(path.parent().ok_or("missing cache directory")?)?;
@@ -329,10 +371,30 @@ async fn install(
     if io::copy(&mut decoder, &mut file)? > 512 * 1024 * 1024 {
         return Err("expanded database exceeds 512 MiB".into());
     }
-    file.flush()?;
+    file.as_file().sync_all()?;
+
     let reader = open(file.path(), kind)?;
     reader.verify()?;
+
     file.persist(path)?;
 
     Ok(reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn date(value: &str) -> DateTime<Utc> {
+        value.parse().unwrap()
+    }
+
+    #[test]
+    fn release_months_skip_the_installed_release() {
+        let now = date("2026-10-31T00:00:00Z");
+
+        assert_eq!(release_months(None, now), ["2026-10", "2026-09"]);
+        assert_eq!(release_months(Some("2026-09"), now), ["2026-10"]);
+        assert!(release_months(Some("2026-10"), now).is_empty());
+    }
 }

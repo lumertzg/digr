@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::io::{self, Write};
 
-use hickory_resolver::proto::rr::{DNSClass, RData, Record, RecordType};
+use hickory_resolver::proto::rr::{RData, Record};
 use hickory_resolver::proto::serialize::binary::BinEncodable;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::{ip_information, record_class, record_type, response_status};
 use crate::dns::{Query, Response};
 use crate::location::{Database, Information, Kind};
 
@@ -97,11 +98,15 @@ struct Warning {
     message: String,
 }
 
+/// Warnings about IP information. The codes keep their schema v1 names.
 #[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum WarningCode {
-    EnrichmentUnavailable,
-    EnrichmentLookupFailed,
+    #[serde(rename = "enrichment_unavailable")]
+    Unavailable,
+    #[serde(rename = "enrichment_lookup_failed")]
+    LookupFailed,
+    #[serde(rename = "enrichment_update_failed")]
+    UpdateFailed,
 }
 
 #[derive(Serialize)]
@@ -128,7 +133,7 @@ impl Document {
             schema_version: 1,
             mode: if trace { Mode::Trace } else { Mode::Lookup },
             query: QuerySummary {
-                name: name.to_string(),
+                name: name.to_ascii(),
                 record_type: record_type(query.record_type),
                 subnet: query
                     .subnet
@@ -164,11 +169,12 @@ impl Document {
         let answers = self.records(&message.answers, databases)?;
         let authority = self.records(&message.authorities, databases)?;
         let additional = self.records(&message.additionals, databases)?;
+
         self.responses.push(ResponseSummary {
             server: response.server.to_string(),
             transport: if response.tcp { "tcp" } else { "udp" },
             elapsed_ms: response.elapsed.as_secs_f64() * 1000.0,
-            status: super::response_status(metadata.response_code),
+            status: response_status(metadata.response_code),
             flags: Flags {
                 authoritative: metadata.authoritative,
                 truncated: metadata.truncation,
@@ -178,7 +184,7 @@ impl Document {
                 checking_disabled: metadata.checking_disabled,
             },
             question: Question {
-                name: question.name().to_string(),
+                name: question.name().to_ascii(),
                 record_type: record_type(question.query_type()),
                 class: record_class(question.query_class()),
             },
@@ -197,9 +203,10 @@ impl Document {
         databases: &[Database],
     ) -> Result<Vec<RecordSummary>, Box<dyn Error>> {
         let mut values = Vec::with_capacity(records.len());
+
         for record in records {
             let mut value = RecordSummary {
-                name: record.name.to_string(),
+                name: record.name.to_ascii(),
                 record_type: record_type(record.data.record_type()),
                 class: record_class(record.dns_class),
                 ttl: record.ttl,
@@ -207,24 +214,20 @@ impl Document {
                 location: None,
                 asn: None,
             };
+
             if let Some(ip) = record.data.ip_addr() {
-                for database in databases {
-                    let information = match database.lookup(ip) {
-                        Ok(information) => information,
-                        Err(error) => {
-                            let message =
-                                format!("{} lookup for {ip} failed: {error}", database.kind);
-                            eprintln!("digr: {message}");
-                            self.warn(WarningCode::EnrichmentLookupFailed, message);
-                            None
-                        }
-                    };
-                    match database.kind {
+                let information = ip_information(databases, ip, |message| {
+                    eprintln!("digr: {message}");
+                    self.warn(WarningCode::LookupFailed, message);
+                });
+                for (kind, information) in information {
+                    match kind {
                         Kind::City => value.location = Some(information),
                         Kind::Asn => value.asn = Some(information),
                     }
                 }
             }
+
             values.push(value);
         }
 
@@ -263,41 +266,29 @@ fn record_data(data: &RData) -> Result<Value, Box<dyn Error>> {
     Ok(match data {
         RData::A(address) => json!({"address": address.to_string()}),
         RData::AAAA(address) => json!({"address": address.to_string()}),
-        RData::ANAME(name) => json!({"target": name.to_string()}),
-        RData::CNAME(name) => json!({"target": name.to_string()}),
-        RData::NS(name) => json!({"target": name.to_string()}),
-        RData::PTR(name) => json!({"target": name.to_string()}),
-        RData::MX(mx) => json!({"preference": mx.preference, "exchange": mx.exchange.to_string()}),
+        RData::ANAME(name) => json!({"target": name.0.to_ascii()}),
+        RData::CNAME(name) => json!({"target": name.0.to_ascii()}),
+        RData::NS(name) => json!({"target": name.0.to_ascii()}),
+        RData::PTR(name) => json!({"target": name.0.to_ascii()}),
+        RData::MX(mx) => json!({"preference": mx.preference, "exchange": mx.exchange.to_ascii()}),
+        // RFC 1035 timers are unsigned, though hickory stores some as i32.
         RData::SOA(soa) => json!({
-            "mname": soa.mname.to_string(), "rname": soa.rname.to_string(),
-            "serial": soa.serial, "refresh": soa.refresh, "retry": soa.retry,
-            "expire": soa.expire, "minimum": soa.minimum,
+            "mname": soa.mname.to_ascii(), "rname": soa.rname.to_ascii(),
+            "serial": soa.serial, "refresh": soa.refresh.cast_unsigned(),
+            "retry": soa.retry.cast_unsigned(), "expire": soa.expire.cast_unsigned(),
+            "minimum": soa.minimum,
         }),
         RData::SRV(srv) => json!({
             "priority": srv.priority, "weight": srv.weight,
-            "port": srv.port, "target": srv.target.to_string(),
+            "port": srv.port, "target": srv.target.to_ascii(),
         }),
         RData::TXT(txt) => json!({"strings": txt.txt_data.iter().map(|bytes| json!({
             "text": std::str::from_utf8(bytes).ok(), "hex": hex(bytes),
         })).collect::<Vec<_>>()}),
-        _ => json!({"text": data.to_string(), "wire_hex": hex(&data.to_bytes()?)}),
+        _ => json!({"text": super::record_value(data), "wire_hex": hex(&data.to_bytes()?)}),
     })
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn record_type(kind: RecordType) -> String {
-    match kind {
-        RecordType::Unknown(code) => format!("TYPE{code}"),
-        _ => kind.to_string(),
-    }
-}
-
-fn record_class(class: DNSClass) -> String {
-    match class {
-        DNSClass::Unknown(code) => format!("CLASS{code}"),
-        _ => class.to_string(),
-    }
 }
