@@ -32,7 +32,7 @@ pub struct Output {
 impl Output {
     pub fn new(query: &Query, trace: bool, verbose: bool, json: bool, enrich: bool) -> Self {
         Self {
-            verbose: verbose || query.dnssec || query.checking_disabled,
+            verbose,
             full_signatures: verbose,
             dnssec_request: (query.dnssec || query.checking_disabled).then(|| {
                 format!(
@@ -397,15 +397,16 @@ fn print_metadata(
         ),
         Color::FG_BRIGHT_BLACK,
     )?;
-    if let Some(request) = dnssec_request {
-        print_line(request, Color::FG_BRIGHT_BLACK)?;
-        print_line(
-            "DNSSEC validation: not performed locally",
-            Color::FG_BRIGHT_BLACK,
-        )?;
-    }
 
     if verbose {
+        if let Some(request) = dnssec_request {
+            print_line(request, Color::FG_BRIGHT_BLACK)?;
+            print_line(
+                "DNSSEC validation: not performed locally",
+                Color::FG_BRIGHT_BLACK,
+            )?;
+        }
+
         print_flags(response)?;
     }
 
