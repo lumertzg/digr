@@ -78,6 +78,12 @@ struct QueryArgs {
     /// Disable the recursion-desired flag on the query.
     #[usage(long)]
     no_recursion: bool,
+    /// Request DNSSEC records (DO). Does not perform local validation.
+    #[usage(long)]
+    dnssec: bool,
+    /// Ask the server to disable DNSSEC checking (CD). Independent of --dnssec.
+    #[usage(long)]
+    checking_disabled: bool,
     /// Per-request timeout in milliseconds, not a total lookup deadline.
     #[usage(long, default = "5000")]
     timeout_ms: NonZeroU64,
@@ -88,6 +94,7 @@ struct QueryArgs {
     #[usage(long)]
     trace: bool,
     /// Show response flags and all answer, authority, and additional sections.
+    /// Include full RRSIG signatures.
     /// AD reports the server's assertion, not local DNSSEC validation.
     #[usage(short = 'v', long)]
     verbose: bool,
@@ -189,6 +196,8 @@ impl TryFrom<QueryArgs> for Command {
                 source: args.source,
                 subnet: subnet.map(|net| ClientSubnet::from(net.trunc())),
                 recursion: !args.no_recursion,
+                dnssec: args.dnssec,
+                checking_disabled: args.checking_disabled,
                 timeout: Duration::from_millis(args.timeout_ms.get()),
                 tries: args.tries,
             },

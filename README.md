@@ -32,6 +32,23 @@ status. A NOERROR response without records of the requested type succeeds,
 but a referral fails.
 Invalid CLI arguments produce no JSON.
 
+## DNSSEC diagnostics
+
+```sh
+digr example.com --dnssec
+digr example.com --dnssec --checking-disabled --server 1.1.1.1
+digr example.com --trace --dnssec
+```
+
+`--dnssec` requests DNSSEC records (DO). `--checking-disabled` independently
+asks the server to skip validation (CD). Both show flags and all record sections.
+Work with `--trace` and `--json`.
+RRSIG shows signing metadata. Full signatures require `--verbose` or `--json`.
+
+No local validation. AD and Extended DNS Errors (EDE) are server-reported.
+EDE appears whenever returned and does not change exit status.
+Malformed DNSSEC records may be rejected before diagnostics.
+
 ## IP information
 
 `--location` and `--asn` use [DB-IP Lite](https://db-ip.com),
