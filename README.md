@@ -41,8 +41,8 @@ digr example.com --trace --dnssec
 ```
 
 `--dnssec` requests DNSSEC records (DO). `--checking-disabled` independently
-asks the server to skip validation (CD). Both show flags and all record sections.
-Work with `--trace` and `--json`.
+asks the server to skip validation (CD). Both work with `--trace` and `--json`.
+`--verbose` adds request details, response flags, EDNS, and all record sections.
 RRSIG shows signing metadata. Full signatures require `--verbose` or `--json`.
 
 No local validation. AD and Extended DNS Errors (EDE) are server-reported.
