@@ -4,7 +4,7 @@ use hickory_resolver::net::NetError;
 use hickory_resolver::proto::op::{DnsResponse, ResponseCode};
 use hickory_resolver::proto::rr::{DNSClass, Name, RData};
 
-use crate::dns::{Nameserver, Query, Response, is_server_failure};
+use crate::dns::{Nameserver, Question, RequestSettings, Response, is_server_failure};
 
 pub struct Hop {
     pub number: usize,
@@ -18,8 +18,10 @@ enum Server {
     Host(Name),
 }
 
-pub struct Trace {
-    query: Query,
+pub struct Trace<'a> {
+    question: &'a Question,
+    settings: &'a RequestSettings,
+    explicit_start: bool,
     servers: Vec<Server>,
     zone: Name,
     hop: Option<Hop>,
@@ -29,11 +31,13 @@ pub struct Trace {
 const START_HINT: &str = "--trace --server needs a server that answers non-recursive queries, \
                           such as a root or TLD server";
 
-impl Trace {
-    pub fn new(mut query: Query) -> Result<Self, NetError> {
-        query.name.set_fqdn(true);
-        query.recursion = false;
-        let servers = match &query.server {
+impl<'a> Trace<'a> {
+    pub fn new(
+        question: &'a Question,
+        settings: &'a RequestSettings,
+        server: Option<&str>,
+    ) -> Result<Self, NetError> {
+        let servers = match server {
             Some(server) => vec![match Nameserver::parse(server)? {
                 Some(address) => Server::Address(address),
                 None => Server::Host(server.parse()?),
@@ -45,7 +49,9 @@ impl Trace {
         };
 
         Ok(Self {
-            query,
+            question,
+            settings,
+            explicit_start: server.is_some(),
             servers,
             zone: Name::root(),
             hop: None,
@@ -89,7 +95,7 @@ impl Trace {
 
     /// Recursive resolvers fail non-recursive queries, a common mistake with --server.
     fn is_explicit_start(&self, hop: usize) -> bool {
-        hop == 1 && self.query.server.is_some()
+        hop == 1 && self.explicit_start
     }
 
     async fn send(&mut self) -> Result<Hop, NetError> {
@@ -102,7 +108,7 @@ impl Trace {
                 Server::Address(address) => vec![*address],
                 Server::Host(name) => {
                     self.spend_work()?;
-                    match self.query.resolve_host(name).await {
+                    match self.settings.resolve_host(name).await {
                         Ok(addresses) => addresses,
                         Err(error) => {
                             last_error = error;
@@ -113,13 +119,13 @@ impl Trace {
             };
 
             for address in addresses {
-                if !self.query.supports_family(address.ip) {
+                if !self.settings.supports_family(address.ip) {
                     continue;
                 }
 
                 self.spend_work()?;
-                let server = address.socket_addr(self.query.port.get());
-                let response = match self.query.request(server).await {
+                let server = address.socket_addr(self.settings.port.get());
+                let response = match self.settings.request(self.question, server).await {
                     Ok(response) => response,
                     Err(error) => {
                         last_error = error;
@@ -166,7 +172,7 @@ impl Trace {
 
         // Authoritative NODATA ends the walk. A positive answer must concern this query.
         if !response.answers.is_empty() {
-            self.query.answer(response)?;
+            self.question.answer(response)?;
         }
 
         Ok(())
@@ -182,7 +188,7 @@ impl Trace {
         Ok(())
     }
 
-    fn referral_zone<'a>(&self, response: &'a DnsResponse) -> Result<&'a Name, NetError> {
+    fn referral_zone<'r>(&self, response: &'r DnsResponse) -> Result<&'r Name, NetError> {
         if !response.answers.is_empty() {
             return Err("trace received a non-authoritative answer instead of a referral".into());
         }
@@ -193,7 +199,7 @@ impl Trace {
             .filter(|record| {
                 record.dns_class == DNSClass::IN
                     && matches!(record.data, RData::NS(_))
-                    && record.name.zone_of(&self.query.name)
+                    && record.name.zone_of(&self.question.name)
                     && self.zone.zone_of(&record.name)
                     && record.name.num_labels() > self.zone.num_labels()
             })
@@ -221,7 +227,7 @@ impl Trace {
                     if glue.dns_class == DNSClass::IN
                         && glue.name == nameserver.0
                         && let Some(ip) = glue.data.ip_addr()
-                        && self.query.supports_family(ip)
+                        && self.settings.supports_family(ip)
                     {
                         push_server(&mut servers, Server::Address(ip.into()));
                         has_glue = true;

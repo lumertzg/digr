@@ -1,12 +1,11 @@
 use std::env;
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
-use std::net::IpAddr;
 
 use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, SIG};
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::rdata::HTTPS;
-use hickory_resolver::proto::rr::{DNSClass, RData, Record, RecordType};
+use hickory_resolver::proto::rr::{DNSClass, RData, RecordType};
 use indicatif::{ProgressBar, ProgressStyle};
 use tabled::builder::Builder;
 use tabled::grid::util::string::get_line_width;
@@ -16,9 +15,9 @@ use tabled::settings::{
     style::BorderColor,
 };
 
-use crate::dns::{Query, Response};
-use crate::location::{Database, Information, Kind, Progress};
-use crate::trace::Hop;
+use crate::dns::{Question, RequestSettings, Response};
+use crate::enrichment::{EnrichedRecord, EnrichedResponse};
+use crate::location::{Database, Kind, Progress};
 
 pub mod json;
 
@@ -30,22 +29,33 @@ pub struct Output {
 }
 
 impl Output {
-    pub fn new(query: &Query, trace: bool, verbose: bool, json: bool, enrich: bool) -> Self {
+    pub fn new(
+        question: &Question,
+        settings: &RequestSettings,
+        trace: bool,
+        verbose: bool,
+        json: bool,
+        enrich: bool,
+    ) -> Self {
         Self {
             verbose,
             full_signatures: verbose,
-            dnssec_request: (query.dnssec || query.checking_disabled).then(|| {
+            dnssec_request: (settings.dnssec || settings.checking_disabled).then(|| {
                 format!(
                     "DNSSEC request: records {} (DO) · checking disabled: {} (CD)",
-                    if query.dnssec {
+                    if settings.dnssec {
                         "requested"
                     } else {
                         "not requested"
                     },
-                    if query.checking_disabled { "yes" } else { "no" }
+                    if settings.checking_disabled {
+                        "yes"
+                    } else {
+                        "no"
+                    }
                 )
             }),
-            document: json.then(|| json::Document::new(query, trace, enrich)),
+            document: json.then(|| json::Document::new(question, settings, trace, enrich)),
         }
     }
 
@@ -58,36 +68,38 @@ impl Output {
 
     pub fn lookup(
         &mut self,
-        responses: &[Response],
-        databases: &[Database],
+        response: EnrichedResponse<'_>,
+        index: usize,
     ) -> Result<(), Box<dyn Error>> {
         if let Some(document) = &mut self.document {
-            for response in responses {
-                document.push(response, None, databases)?;
-            }
+            document.push(response, None)?;
         } else {
             print_lookup(
-                responses,
+                &response,
+                index,
                 self.verbose,
                 self.full_signatures,
                 self.dnssec_request.as_deref(),
-                databases,
             )?;
         }
 
         Ok(())
     }
 
-    pub fn hop(&mut self, hop: &Hop, databases: &[Database]) -> Result<(), Box<dyn Error>> {
+    pub fn hop(
+        &mut self,
+        response: EnrichedResponse<'_>,
+        number: usize,
+    ) -> Result<(), Box<dyn Error>> {
         if let Some(document) = &mut self.document {
-            document.push(&hop.response, Some(hop.number), databases)?;
+            document.push(response, Some(number))?;
         } else {
             print_hop(
-                hop,
+                &response,
+                number,
                 self.verbose,
                 self.full_signatures,
                 self.dnssec_request.as_deref(),
-                databases,
             )?;
         }
 
@@ -110,47 +122,39 @@ impl Output {
 }
 
 fn print_lookup(
-    responses: &[Response],
+    response: &EnrichedResponse<'_>,
+    index: usize,
     verbose: bool,
     full_signatures: bool,
     dnssec_request: Option<&str>,
-    databases: &[Database],
 ) -> io::Result<()> {
-    for (index, response) in responses.iter().enumerate() {
-        let question = &response.message.queries[0];
+    let question = &response.response.message.queries[0];
 
-        if index > 0 {
-            writeln!(io::stdout().lock())?;
-        }
-
-        let title = format!(
-            "{} {}",
-            question.name().to_ascii(),
-            record_type(question.query_type())
-        );
-        print_response(
-            response,
-            &title,
-            verbose,
-            full_signatures,
-            dnssec_request,
-            databases,
-        )?;
+    if index > 0 {
+        writeln!(io::stdout().lock())?;
     }
 
-    Ok(())
+    let title = format!(
+        "{} {}",
+        question.name().to_ascii(),
+        record_type(question.query_type())
+    );
+
+    print_response(response, &title, verbose, full_signatures, dnssec_request)
 }
 
 fn print_records(
-    records: &[Record],
-    databases: &[Database],
+    records: &[EnrichedRecord<'_>],
+    kinds: &[Kind],
     full_signatures: bool,
 ) -> io::Result<()> {
-    let enrich =
-        !databases.is_empty() && records.iter().any(|record| record.data.ip_addr().is_some());
+    let enrich = !kinds.is_empty()
+        && records
+            .iter()
+            .any(|record| record.record.data.ip_addr().is_some());
     let show_class = records
         .iter()
-        .any(|record| record.dns_class != DNSClass::IN);
+        .any(|record| record.record.dns_class != DNSClass::IN);
     let mut builder = Builder::default();
 
     let mut header = vec!["Name", "Type"];
@@ -159,8 +163,8 @@ fn print_records(
     }
     header.extend(["TTL (s)", "Value"]);
     if enrich {
-        for database in databases {
-            header.push(match database.kind {
+        for kind in kinds {
+            header.push(match kind {
                 Kind::City => "Location",
                 Kind::Asn => "ASN / Network",
             });
@@ -168,7 +172,8 @@ fn print_records(
     }
     builder.push_record(header);
 
-    for record in records {
+    for enriched in records {
+        let record = enriched.record;
         let mut row = vec![record.name.to_ascii(), record_type(record.record_type())];
         if show_class {
             row.push(record_class(record.dns_class));
@@ -179,14 +184,11 @@ fn print_records(
         ]);
 
         if enrich {
-            let information = record
-                .data
-                .ip_addr()
-                .map(|ip| ip_information(databases, ip, |message| eprintln!("digr: {message}")));
-            for index in 0..databases.len() {
-                let value = information
-                    .as_ref()
-                    .and_then(|information| information[index].1.as_ref())
+            for index in 0..kinds.len() {
+                let value = enriched
+                    .information
+                    .get(index)
+                    .and_then(|(_, information)| information.as_ref())
                     .map_or_else(|| "—".to_owned(), ToString::to_string);
                 row.push(value);
             }
@@ -302,43 +304,41 @@ fn print_stacked(rows: Vec<Vec<String>>, width: usize) -> io::Result<()> {
 }
 
 fn print_hop(
-    hop: &Hop,
+    response: &EnrichedResponse<'_>,
+    number: usize,
     verbose: bool,
     full_signatures: bool,
     dnssec_request: Option<&str>,
-    databases: &[Database],
 ) -> io::Result<()> {
-    let role = if hop.response.message.metadata.response_code != ResponseCode::NoError {
+    let role = if response.response.message.metadata.response_code != ResponseCode::NoError {
         "Response"
-    } else if hop.response.message.metadata.authoritative {
+    } else if response.response.message.metadata.authoritative {
         "Authoritative"
     } else {
         "Referral"
     };
 
-    if hop.number > 1 {
+    if number > 1 {
         writeln!(io::stdout().lock())?;
     }
 
     print_response(
-        &hop.response,
-        &format!("Hop {} · {role}", hop.number),
+        response,
+        &format!("Hop {number} · {role}"),
         verbose,
         full_signatures,
         dnssec_request,
-        databases,
     )
 }
 
 fn print_response(
-    response: &Response,
+    response: &EnrichedResponse<'_>,
     title: &str,
     verbose: bool,
     full_signatures: bool,
     dnssec_request: Option<&str>,
-    databases: &[Database],
 ) -> io::Result<()> {
-    let message = &response.message;
+    let message = &response.response.message;
     let status = message.metadata.response_code;
     let color = if status != ResponseCode::NoError {
         Color::FG_YELLOW
@@ -349,26 +349,26 @@ fn print_response(
     };
     let status = response_status(status);
     print_line(&escape(&format!("{title} · {status}")), color | Color::BOLD)?;
-    print_metadata(response, verbose, dnssec_request)?;
+    print_metadata(response.response, verbose, dnssec_request)?;
     writeln!(io::stdout().lock())?;
 
     if verbose {
         for (name, records) in [
-            ("Answer", &message.answers),
-            ("Authority", &message.authorities),
-            ("Additional", &message.additionals),
+            ("Answer", &response.answers),
+            ("Authority", &response.authority),
+            ("Additional", &response.additional),
         ] {
             if !records.is_empty() {
-                print_section(name, records, databases, full_signatures)?;
+                print_section(name, records, &response.kinds, full_signatures)?;
             }
         }
     } else if !message.answers.is_empty() {
-        print_records(&message.answers, databases, full_signatures)?;
+        print_records(&response.answers, &response.kinds, full_signatures)?;
     } else if !message.authorities.is_empty() {
         print_section(
             "Authority",
-            &message.authorities,
-            databases,
+            &response.authority,
+            &response.kinds,
             full_signatures,
         )?;
     }
@@ -476,15 +476,15 @@ fn print_flags(response: &Response) -> io::Result<()> {
 
 fn print_section(
     name: &str,
-    records: &[Record],
-    databases: &[Database],
+    records: &[EnrichedRecord<'_>],
+    kinds: &[Kind],
     full_signatures: bool,
 ) -> io::Result<()> {
     print_line(
         &format!("{name} · {}", records.len()),
         Color::FG_GREEN | Color::BOLD,
     )?;
-    print_records(records, databases, full_signatures)
+    print_records(records, kinds, full_signatures)
 }
 
 fn print_location_source(databases: &[Database]) -> io::Result<()> {
@@ -588,25 +588,6 @@ fn colors_enabled() -> bool {
     io::stdout().is_terminal()
         && env::var_os("NO_COLOR").is_none()
         && env::var_os("TERM").is_none_or(|term| term != "dumb")
-}
-
-/// Looks up an address in each database, in order. A failed lookup is reported and yields
-/// no information.
-fn ip_information(
-    databases: &[Database],
-    ip: IpAddr,
-    mut warn: impl FnMut(String),
-) -> Vec<(Kind, Option<Information>)> {
-    databases
-        .iter()
-        .map(|database| {
-            let information = database.lookup(ip).unwrap_or_else(|error| {
-                warn(format!("{} lookup for {ip} failed: {error}", database.kind));
-                None
-            });
-            (database.kind, information)
-        })
-        .collect()
 }
 
 fn record_type(kind: RecordType) -> String {

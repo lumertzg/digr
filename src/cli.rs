@@ -7,7 +7,7 @@ use hickory_resolver::proto::rr::{Name, RecordType};
 use ipnet::IpNet;
 use usage_rs::{Cli, Subcommands, ValidationError};
 
-use crate::dns::{Nameserver, Query};
+use crate::dns::{Nameserver, Question, RequestSettings};
 use crate::location::Kind;
 
 /// Query DNS records.
@@ -117,7 +117,9 @@ pub enum Command {
 }
 
 pub struct QueryOptions {
-    pub query: Query,
+    pub question: Question,
+    pub settings: RequestSettings,
+    pub server: Option<String>,
     pub trace: bool,
     pub verbose: bool,
     pub json: bool,
@@ -168,7 +170,7 @@ impl TryFrom<QueryArgs> for Command {
             .as_deref()
             .map(parse_record_type)
             .transpose()?;
-        let (name, record_type) = match args.reverse {
+        let (mut name, record_type) = match args.reverse {
             Some(ip) => {
                 if record_type.is_some_and(|kind| kind != RecordType::PTR) {
                     return Err(ValidationError::field("--type")
@@ -183,24 +185,24 @@ impl TryFrom<QueryArgs> for Command {
                 record_type.unwrap_or(RecordType::A),
             ),
         };
+        name.set_fqdn(true);
 
         Ok(Command::Query(QueryOptions {
-            query: Query {
-                name,
-                record_type,
-                server: args.server,
+            question: Question { name, record_type },
+            settings: RequestSettings {
                 port: args.port,
                 tcp: args.tcp,
                 ipv4: args.ipv4,
                 ipv6: args.ipv6,
                 source: args.source,
                 subnet: subnet.map(|net| ClientSubnet::from(net.trunc())),
-                recursion: !args.no_recursion,
+                recursion: !args.no_recursion && !args.trace,
                 dnssec: args.dnssec,
                 checking_disabled: args.checking_disabled,
                 timeout: Duration::from_millis(args.timeout_ms.get()),
                 tries: args.tries,
             },
+            server: args.server,
             trace: args.trace,
             verbose: args.verbose,
             json: args.json,

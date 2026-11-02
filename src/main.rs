@@ -1,5 +1,6 @@
 mod cli;
 mod dns;
+mod enrichment;
 mod location;
 mod output;
 mod trace;
@@ -25,7 +26,8 @@ async fn main() -> ExitCode {
 
 async fn run(options: cli::QueryOptions) -> Result<(), Box<dyn Error>> {
     let mut output = output::Output::new(
-        &options.query,
+        &options.question,
+        &options.settings,
         options.trace,
         options.verbose,
         options.json,
@@ -34,9 +36,9 @@ async fn run(options: cli::QueryOptions) -> Result<(), Box<dyn Error>> {
     let databases = load_databases(options.location, options.asn, &mut output).await;
 
     let result = if options.trace {
-        run_trace(options.query, &databases, &mut output).await
+        run_trace(&options, &databases, &mut output).await
     } else {
-        run_lookup(options.query, &databases, &mut output).await
+        run_lookup(&options, &databases, &mut output).await
     };
 
     let finished = output.finish(
@@ -86,28 +88,56 @@ async fn load_databases(
 }
 
 async fn run_trace(
-    query: dns::Query,
+    options: &cli::QueryOptions,
     databases: &[location::Database],
     output: &mut output::Output,
 ) -> Result<(), Box<dyn Error>> {
-    let mut trace = trace::Trace::new(query)?;
+    let mut trace = trace::Trace::new(
+        &options.question,
+        &options.settings,
+        options.server.as_deref(),
+    )?;
 
     while let Some(hop) = trace.next().await? {
-        output.hop(hop, databases)?;
+        let enriched = enrichment::EnrichedResponse::new(
+            &hop.response,
+            databases,
+            options.json || options.verbose,
+            |message| output.warn(output::json::WarningCode::LookupFailed, message),
+        );
+        output.hop(enriched, hop.number)?;
     }
 
     Ok(())
 }
 
 async fn run_lookup(
-    query: dns::Query,
+    options: &cli::QueryOptions,
     databases: &[location::Database],
     output: &mut output::Output,
 ) -> Result<(), Box<dyn Error>> {
     let mut responses = Vec::new();
-    let result = query.lookup(&mut responses).await;
+    let result = dns::lookup(
+        options.question.clone(),
+        &options.settings,
+        options.server.as_deref(),
+        &mut responses,
+    )
+    .await;
 
-    let printed = output.lookup(&responses, databases);
+    let printed = responses
+        .iter()
+        .enumerate()
+        .try_for_each(|(index, response)| {
+            let enriched = enrichment::EnrichedResponse::new(
+                response,
+                databases,
+                options.json || options.verbose,
+                |message| output.warn(output::json::WarningCode::LookupFailed, message),
+            );
+
+            output.lookup(enriched, index)
+        });
 
     // The DNS failure matters more than a failure to print it.
     result?;
