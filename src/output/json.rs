@@ -1,13 +1,14 @@
 use std::error::Error;
 use std::io::{self, Write};
 
-use hickory_resolver::proto::rr::{RData, Record};
+use hickory_resolver::proto::rr::RData;
 use hickory_resolver::proto::serialize::binary::BinEncodable;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{ip_information, record_class, record_type, response_status};
-use crate::dns::{Query, Response};
+use super::{record_class, record_type, response_status};
+use crate::dns::{Question as DnsQuestion, RequestSettings};
+use crate::enrichment::{EnrichedRecord, EnrichedResponse};
 use crate::location::{Database, Information, Kind};
 
 #[derive(Serialize)]
@@ -145,21 +146,23 @@ struct DatabaseSource {
 }
 
 impl Document {
-    pub fn new(query: &Query, trace: bool, enrich: bool) -> Self {
-        let mut name = query.name.clone();
-        name.set_fqdn(true);
-
+    pub fn new(
+        question: &DnsQuestion,
+        settings: &RequestSettings,
+        trace: bool,
+        enrich: bool,
+    ) -> Self {
         Self {
             schema_version: 1,
             mode: if trace { Mode::Trace } else { Mode::Lookup },
             query: QuerySummary {
-                name: name.to_ascii(),
-                record_type: record_type(query.record_type),
-                subnet: query
+                name: question.name.to_ascii(),
+                record_type: record_type(question.record_type),
+                subnet: settings
                     .subnet
                     .map(|subnet| format!("{}/{}", subnet.addr(), subnet.source_prefix())),
-                dnssec: query.dnssec,
-                checking_disabled: query.checking_disabled,
+                dnssec: settings.dnssec,
+                checking_disabled: settings.checking_disabled,
                 local_validation: "not_performed",
             },
             responses: Vec::new(),
@@ -182,16 +185,16 @@ impl Document {
 
     pub fn push(
         &mut self,
-        response: &Response,
+        enriched: EnrichedResponse<'_>,
         hop: Option<usize>,
-        databases: &[Database],
     ) -> Result<(), Box<dyn Error>> {
+        let response = enriched.response;
         let message = &response.message;
         let metadata = &message.metadata;
         let question = &message.queries[0];
-        let answers = self.records(&message.answers, databases)?;
-        let authority = self.records(&message.authorities, databases)?;
-        let additional = self.records(&message.additionals, databases)?;
+        let answers = Self::records(enriched.answers)?;
+        let authority = Self::records(enriched.authority)?;
+        let additional = Self::records(enriched.additional)?;
 
         self.responses.push(ResponseSummary {
             server: response.server.to_string(),
@@ -234,14 +237,11 @@ impl Document {
         Ok(())
     }
 
-    fn records(
-        &mut self,
-        records: &[Record],
-        databases: &[Database],
-    ) -> Result<Vec<RecordSummary>, Box<dyn Error>> {
+    fn records(records: Vec<EnrichedRecord<'_>>) -> Result<Vec<RecordSummary>, Box<dyn Error>> {
         let mut values = Vec::with_capacity(records.len());
 
-        for record in records {
+        for enriched in records {
+            let record = enriched.record;
             let mut value = RecordSummary {
                 name: record.name.to_ascii(),
                 record_type: record_type(record.data.record_type()),
@@ -252,16 +252,10 @@ impl Document {
                 asn: None,
             };
 
-            if let Some(ip) = record.data.ip_addr() {
-                let information = ip_information(databases, ip, |message| {
-                    eprintln!("digr: {message}");
-                    self.warn(WarningCode::LookupFailed, message);
-                });
-                for (kind, information) in information {
-                    match kind {
-                        Kind::City => value.location = Some(information),
-                        Kind::Asn => value.asn = Some(information),
-                    }
+            for (kind, information) in enriched.information {
+                match kind {
+                    Kind::City => value.location = Some(information),
+                    Kind::Asn => value.asn = Some(information),
                 }
             }
 

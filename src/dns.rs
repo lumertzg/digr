@@ -17,11 +17,13 @@ use hickory_resolver::proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
 use hickory_resolver::proto::rr::{DNSClass, Name, RData, RecordType};
 use hickory_resolver::{Resolver, TokioResolver};
 
-/// A single DNS lookup using an explicit server or the system nameservers.
-pub struct Query {
+#[derive(Clone)]
+pub struct Question {
     pub name: Name,
     pub record_type: RecordType,
-    pub server: Option<String>,
+}
+
+pub struct RequestSettings {
     pub port: NonZeroU16,
     pub tcp: bool,
     pub ipv4: bool,
@@ -155,57 +157,7 @@ pub enum Answer {
     Cname(Name),
 }
 
-impl Query {
-    /// Requires an empty response vector. Received responses remain available on failure.
-    pub async fn lookup(mut self, responses: &mut Vec<Response>) -> Result<(), NetError> {
-        let servers = match self.server.as_deref() {
-            Some(server) => self.nameservers(server).await?,
-            None => system_nameservers()?,
-        };
-
-        self.name.set_fqdn(true);
-
-        for _ in 0..16 {
-            let response = self.send(&servers).await?;
-            let answer = self.answer(&response.message);
-            responses.push(response);
-
-            let name = match answer? {
-                Answer::Found | Answer::NoData => return Ok(()),
-                Answer::Cname(name) => name,
-            };
-            if responses
-                .iter()
-                .any(|response| response.message.queries[0].name() == &name)
-            {
-                return Err("CNAME loop detected".into());
-            }
-
-            self.name = name;
-        }
-
-        Err("CNAME query limit exceeded".into())
-    }
-
-    async fn send(&self, servers: &[Nameserver]) -> Result<Response, NetError> {
-        let mut last_error = NetError::from("no nameservers match the requested transport family");
-        let mut failure = None;
-
-        for &server in servers {
-            if !self.supports_family(server.ip) {
-                continue;
-            }
-
-            match self.request(server.socket_addr(self.port.get())).await {
-                Ok(response) if is_server_failure(&response.message) => failure = Some(response),
-                Ok(response) => return Ok(response),
-                Err(error) => last_error = error,
-            }
-        }
-
-        failure.ok_or(last_error)
-    }
-
+impl Question {
     pub(crate) fn answer(&self, message: &DnsResponse) -> Result<Answer, NetError> {
         if message.metadata.response_code != ResponseCode::NoError {
             return Err(format!("query returned {}", message.metadata.response_code).into());
@@ -241,10 +193,76 @@ impl Query {
 
         Err("CNAME loop detected".into())
     }
+}
 
-    pub(crate) async fn request(&self, server: SocketAddr) -> Result<Response, NetError> {
+/// Requires an empty response vector. Received responses remain available on failure.
+pub async fn lookup(
+    mut question: Question,
+    settings: &RequestSettings,
+    server: Option<&str>,
+    responses: &mut Vec<Response>,
+) -> Result<(), NetError> {
+    let servers = match server {
+        Some(server) => settings.nameservers(server).await?,
+        None => system_nameservers()?,
+    };
+
+    for _ in 0..16 {
+        let response = settings.send(&question, &servers).await?;
+        let answer = question.answer(&response.message);
+        responses.push(response);
+
+        let name = match answer? {
+            Answer::Found | Answer::NoData => return Ok(()),
+            Answer::Cname(name) => name,
+        };
+        if responses
+            .iter()
+            .any(|response| response.message.queries[0].name() == &name)
+        {
+            return Err("CNAME loop detected".into());
+        }
+
+        question.name = name;
+    }
+
+    Err("CNAME query limit exceeded".into())
+}
+
+impl RequestSettings {
+    async fn send(
+        &self,
+        question: &Question,
+        servers: &[Nameserver],
+    ) -> Result<Response, NetError> {
+        let mut last_error = NetError::from("no nameservers match the requested transport family");
+        let mut failure = None;
+
+        for &server in servers {
+            if !self.supports_family(server.ip) {
+                continue;
+            }
+
+            match self
+                .request(question, server.socket_addr(self.port.get()))
+                .await
+            {
+                Ok(response) if is_server_failure(&response.message) => failure = Some(response),
+                Ok(response) => return Ok(response),
+                Err(error) => last_error = error,
+            }
+        }
+
+        failure.ok_or(last_error)
+    }
+
+    pub(crate) async fn request(
+        &self,
+        question: &Question,
+        server: SocketAddr,
+    ) -> Result<Response, NetError> {
         if !self.tcp {
-            let (message, elapsed) = self.retry(server, false).await?;
+            let (message, elapsed) = self.retry(question, server, false).await?;
             if !message.metadata.truncation {
                 return Ok(Response {
                     server,
@@ -255,7 +273,7 @@ impl Query {
             }
         }
 
-        let (message, elapsed) = self.retry(server, true).await?;
+        let (message, elapsed) = self.retry(question, server, true).await?;
         if message.metadata.truncation {
             return Err(format!("{server}: truncated response over TCP").into());
         }
@@ -271,6 +289,7 @@ impl Query {
     /// The elapsed time covers only the exchange that succeeded.
     async fn retry(
         &self,
+        question: &Question,
         server: SocketAddr,
         tcp: bool,
     ) -> Result<(DnsResponse, Duration), NetError> {
@@ -278,7 +297,7 @@ impl Query {
 
         for _ in 0..self.tries.get() {
             let start = Instant::now();
-            match self.exchange(server, tcp).await {
+            match self.exchange(question, server, tcp).await {
                 Ok(response) => return Ok((response, start.elapsed())),
                 Err(error) => last_error = error,
             }
@@ -287,7 +306,12 @@ impl Query {
         Err(format!("{server}: {last_error}").into())
     }
 
-    async fn exchange(&self, server: SocketAddr, tcp: bool) -> Result<DnsResponse, NetError> {
+    async fn exchange(
+        &self,
+        question: &Question,
+        server: SocketAddr,
+        tcp: bool,
+    ) -> Result<DnsResponse, NetError> {
         // Keep the provider alive while its TCP background task handles the response.
         let provider = TokioRuntimeProvider::default();
         let source = self.source.map(|ip| SocketAddr::new(ip, 0));
@@ -300,7 +324,7 @@ impl Query {
                 .with_max_retries(0)
                 .exchange()
         };
-        let question = DnsQuery::query(self.name.clone(), self.record_type);
+        let question = DnsQuery::query(question.name.clone(), question.record_type);
         let mut options = DnsRequestOptions::default();
         options.recursion_desired = self.recursion;
         options.edns_set_dnssec_ok = self.dnssec;
@@ -516,22 +540,10 @@ mod tests {
 
     use super::*;
 
-    fn query(name: &str) -> Query {
-        Query {
+    fn query(name: &str) -> Question {
+        Question {
             name: Name::from_ascii(name).unwrap(),
             record_type: RecordType::A,
-            server: None,
-            port: NonZeroU16::new(53).unwrap(),
-            tcp: false,
-            ipv4: false,
-            ipv6: false,
-            source: None,
-            subnet: None,
-            recursion: true,
-            dnssec: false,
-            checking_disabled: false,
-            timeout: Duration::from_secs(1),
-            tries: NonZeroUsize::MIN,
         }
     }
 
