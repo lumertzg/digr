@@ -23,7 +23,6 @@ pub mod json;
 
 pub struct Output {
     verbose: bool,
-    full_signatures: bool,
     dnssec_request: Option<String>,
     document: Option<json::Document>,
 }
@@ -39,7 +38,6 @@ impl Output {
     ) -> Self {
         Self {
             verbose,
-            full_signatures: verbose,
             dnssec_request: (settings.dnssec || settings.checking_disabled).then(|| {
                 format!(
                     "DNSSEC request: records {} (DO) · checking disabled: {} (CD)",
@@ -78,7 +76,6 @@ impl Output {
                 &response,
                 index,
                 self.verbose,
-                self.full_signatures,
                 self.dnssec_request.as_deref(),
             )?;
         }
@@ -98,7 +95,6 @@ impl Output {
                 &response,
                 number,
                 self.verbose,
-                self.full_signatures,
                 self.dnssec_request.as_deref(),
             )?;
         }
@@ -125,10 +121,9 @@ fn print_lookup(
     response: &EnrichedResponse<'_>,
     index: usize,
     verbose: bool,
-    full_signatures: bool,
     dnssec_request: Option<&str>,
 ) -> io::Result<()> {
-    let question = &response.response.message.queries[0];
+    let question = response.response.question();
 
     if index > 0 {
         writeln!(io::stdout().lock())?;
@@ -140,7 +135,7 @@ fn print_lookup(
         record_type(question.query_type())
     );
 
-    print_response(response, &title, verbose, full_signatures, dnssec_request)
+    print_response(response, &title, verbose, dnssec_request)
 }
 
 fn print_records(
@@ -184,10 +179,11 @@ fn print_records(
         ]);
 
         if enrich {
-            for index in 0..kinds.len() {
+            for kind in kinds {
                 let value = enriched
                     .information
-                    .get(index)
+                    .iter()
+                    .find(|(candidate, _)| candidate == kind)
                     .and_then(|(_, information)| information.as_ref())
                     .map_or_else(|| "—".to_owned(), ToString::to_string);
                 row.push(value);
@@ -307,12 +303,11 @@ fn print_hop(
     response: &EnrichedResponse<'_>,
     number: usize,
     verbose: bool,
-    full_signatures: bool,
     dnssec_request: Option<&str>,
 ) -> io::Result<()> {
-    let role = if response.response.message.metadata.response_code != ResponseCode::NoError {
+    let role = if response.response.message().metadata.response_code != ResponseCode::NoError {
         "Response"
-    } else if response.response.message.metadata.authoritative {
+    } else if response.response.message().metadata.authoritative {
         "Authoritative"
     } else {
         "Referral"
@@ -326,7 +321,6 @@ fn print_hop(
         response,
         &format!("Hop {number} · {role}"),
         verbose,
-        full_signatures,
         dnssec_request,
     )
 }
@@ -335,10 +329,9 @@ fn print_response(
     response: &EnrichedResponse<'_>,
     title: &str,
     verbose: bool,
-    full_signatures: bool,
     dnssec_request: Option<&str>,
 ) -> io::Result<()> {
-    let message = &response.response.message;
+    let message = response.response.message();
     let status = message.metadata.response_code;
     let color = if status != ResponseCode::NoError {
         Color::FG_YELLOW
@@ -359,18 +352,13 @@ fn print_response(
             ("Additional", &response.additional),
         ] {
             if !records.is_empty() {
-                print_section(name, records, &response.kinds, full_signatures)?;
+                print_section(name, records, &response.kinds, verbose)?;
             }
         }
     } else if !message.answers.is_empty() {
-        print_records(&response.answers, &response.kinds, full_signatures)?;
+        print_records(&response.answers, &response.kinds, verbose)?;
     } else if !message.authorities.is_empty() {
-        print_section(
-            "Authority",
-            &response.authority,
-            &response.kinds,
-            full_signatures,
-        )?;
+        print_section("Authority", &response.authority, &response.kinds, verbose)?;
     }
 
     if message.answers.is_empty()
@@ -414,7 +402,7 @@ fn print_metadata(
 }
 
 fn print_edns(response: &Response, verbose: bool) -> io::Result<()> {
-    if verbose && let Some(edns) = &response.message.edns {
+    if verbose && let Some(edns) = &response.message().edns {
         print_line(
             &format!(
                 "EDNS: version {} · UDP payload {} bytes · DNSSEC OK (DO): {}",
@@ -445,7 +433,7 @@ fn print_edns(response: &Response, verbose: bool) -> io::Result<()> {
 }
 
 fn print_flags(response: &Response) -> io::Result<()> {
-    let metadata = &response.message.metadata;
+    let metadata = &response.message().metadata;
     let flags = [
         (metadata.authoritative, "authoritative (AA)"),
         (metadata.truncation, "truncated (TC)"),

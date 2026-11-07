@@ -5,6 +5,7 @@ use crate::location::{Database, Information, Kind};
 
 pub struct EnrichedRecord<'a> {
     pub record: &'a Record,
+    /// Empty when not applicable or not requested. None means an attempted lookup had no result.
     pub information: Vec<(Kind, Option<Information>)>,
 }
 
@@ -23,7 +24,7 @@ impl<'a> EnrichedResponse<'a> {
         all_sections: bool,
         mut warn: impl FnMut(String),
     ) -> Self {
-        let message = &response.message;
+        let message = response.message();
         let mut prepare = |records: &'a [Record], visible: bool| {
             records
                 .iter()
@@ -36,10 +37,13 @@ impl<'a> EnrichedResponse<'a> {
                         .flat_map(|ip| databases.iter().map(move |database| (ip, database)))
                         .map(|(ip, database)| {
                             let information = database.lookup(ip).unwrap_or_else(|error| {
-                                warn(format!("{} lookup for {ip} failed: {error}", database.kind));
+                                warn(format!(
+                                    "{} lookup for {ip} failed: {error}",
+                                    database.kind()
+                                ));
                                 None
                             });
-                            (database.kind, information)
+                            (database.kind(), information)
                         })
                         .collect();
 
@@ -53,7 +57,7 @@ impl<'a> EnrichedResponse<'a> {
 
         Self {
             response,
-            kinds: databases.iter().map(|database| database.kind).collect(),
+            kinds: databases.iter().map(Database::kind).collect(),
             answers: prepare(&message.answers, true),
             authority: prepare(
                 &message.authorities,

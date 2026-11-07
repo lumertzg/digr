@@ -45,6 +45,8 @@ impl<'a> Trace<'a> {
         settings: &'a RequestSettings,
         server: Option<&str>,
     ) -> Result<Self, NetError> {
+        assert!(!settings.recursion, "trace requires non-recursive requests");
+
         let servers = match server {
             Some(server) => vec![match Nameserver::parse(server)? {
                 Some(address) => Server::Address(address),
@@ -93,7 +95,7 @@ impl<'a> Trace<'a> {
     }
 
     fn next_state(&self, hop: &Hop, zone: &Name) -> Result<State, NetError> {
-        let message = &hop.response.message;
+        let message = hop.response.message();
         if message.metadata.response_code != ResponseCode::NoError {
             let mut error = format!(
                 "trace received {} from {}",
@@ -153,7 +155,7 @@ impl<'a> Trace<'a> {
             };
 
             for address in addresses {
-                if !self.settings.supports_family(address.ip) {
+                if !self.settings.supports_family(address.ip()) {
                     continue;
                 }
 
@@ -167,13 +169,13 @@ impl<'a> Trace<'a> {
                     }
                 };
 
-                if is_server_failure(&response.message) {
+                if is_server_failure(response.message()) {
                     failure = Some(response);
                     continue;
                 }
 
-                if response.message.metadata.response_code == ResponseCode::NoError
-                    && let Err(error) = self.validate_response(&response.message, zone)
+                if response.message().metadata.response_code == ResponseCode::NoError
+                    && let Err(error) = self.validate_response(response.message(), zone)
                 {
                     last_error = if self.is_explicit_start(number) {
                         format!("{server}: {error} ({START_HINT})")
@@ -229,7 +231,7 @@ impl<'a> Trace<'a> {
             .filter(|record| {
                 record.dns_class == DNSClass::IN
                     && matches!(record.data, RData::NS(_))
-                    && record.name.zone_of(&self.question.name)
+                    && record.name.zone_of(self.question.name())
                     && zone.zone_of(&record.name)
                     && record.name.num_labels() > zone.num_labels()
             })

@@ -17,17 +17,34 @@ use hickory_resolver::proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
 use hickory_resolver::proto::rr::{DNSClass, Name, RData, RecordType};
 use hickory_resolver::{Resolver, TokioResolver};
 
+/// An absolute IN-class question with a queryable record type.
 #[derive(Clone)]
 pub struct Question {
-    pub name: Name,
-    pub record_type: RecordType,
+    name: Name,
+    record_type: RecordType,
+}
+
+#[derive(Clone, Copy)]
+pub enum AddressFamily {
+    Any,
+    Ipv4,
+    Ipv6,
+}
+
+impl AddressFamily {
+    pub fn supports(self, ip: IpAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Ipv4 => ip.is_ipv4(),
+            Self::Ipv6 => ip.is_ipv6(),
+        }
+    }
 }
 
 pub struct RequestSettings {
     pub port: NonZeroU16,
     pub tcp: bool,
-    pub ipv4: bool,
-    pub ipv6: bool,
+    pub family: AddressFamily,
     pub source: Option<IpAddr>,
     pub subnet: Option<ClientSubnet>,
     pub recursion: bool,
@@ -38,11 +55,13 @@ pub struct RequestSettings {
     pub tries: NonZeroUsize,
 }
 
+/// A complete DNS exchange with exactly one question matching the request.
+/// Only the DNS transport constructs responses. Consumers cannot mutate the validated message.
 pub struct Response {
     pub server: SocketAddr,
     pub tcp: bool,
     pub elapsed: Duration,
-    pub message: DnsResponse,
+    message: DnsResponse,
 }
 
 /// An untrusted, server-reported Extended DNS Error (RFC 8914).
@@ -54,6 +73,14 @@ pub struct ExtendedError<'a> {
 }
 
 impl Response {
+    pub fn message(&self) -> &DnsResponse {
+        &self.message
+    }
+
+    pub fn question(&self) -> &DnsQuery {
+        &self.message.queries[0]
+    }
+
     pub fn extended_errors(&self) -> impl Iterator<Item = ExtendedError<'_>> {
         self.message
             .edns
@@ -108,7 +135,7 @@ impl Response {
 /// A nameserver address. A nonzero scope selects the interface of a link-local IPv6 server.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Nameserver {
-    pub ip: IpAddr,
+    ip: IpAddr,
     scope: u32,
 }
 
@@ -131,6 +158,10 @@ impl Nameserver {
             ip: ip.into(),
             scope: scope_id(zone)?,
         }))
+    }
+
+    pub fn ip(self) -> IpAddr {
+        self.ip
     }
 
     pub fn socket_addr(self, port: u16) -> SocketAddr {
@@ -158,6 +189,24 @@ pub enum Answer {
 }
 
 impl Question {
+    pub fn new(mut name: Name, record_type: RecordType) -> Self {
+        assert!(
+            !matches!(record_type, RecordType::OPT | RecordType::ZERO),
+            "question requires a queryable record type"
+        );
+        name.set_fqdn(true);
+
+        Self { name, record_type }
+    }
+
+    pub fn name(&self) -> &Name {
+        &self.name
+    }
+
+    pub fn record_type(&self) -> RecordType {
+        self.record_type
+    }
+
     pub(crate) fn answer(&self, message: &DnsResponse) -> Result<Answer, NetError> {
         if message.metadata.response_code != ResponseCode::NoError {
             return Err(format!("query returned {}", message.metadata.response_code).into());
@@ -195,13 +244,15 @@ impl Question {
     }
 }
 
-/// Requires an empty response vector. Received responses remain available on failure.
+/// Received responses remain available on failure. The output vector must start empty.
 pub async fn lookup(
     mut question: Question,
     settings: &RequestSettings,
     server: Option<&str>,
     responses: &mut Vec<Response>,
 ) -> Result<(), NetError> {
+    assert!(responses.is_empty(), "lookup responses must start empty");
+
     let servers = match server {
         Some(server) => settings.nameservers(server).await?,
         None => system_nameservers()?,
@@ -218,7 +269,7 @@ pub async fn lookup(
         };
         if responses
             .iter()
-            .any(|response| response.message.queries[0].name() == &name)
+            .any(|response| response.question().name() == &name)
         {
             return Err("CNAME loop detected".into());
         }
@@ -386,8 +437,11 @@ impl RequestSettings {
     }
 
     fn resolver(&self, servers: Vec<Nameserver>) -> Result<TokioResolver, NetError> {
-        let ipv4 = self.ipv4 || self.source.is_some_and(|ip| ip.is_ipv4());
-        let ipv6 = self.ipv6 || self.source.is_some_and(|ip| ip.is_ipv6());
+        let family = match self.source {
+            Some(IpAddr::V4(_)) => AddressFamily::Ipv4,
+            Some(IpAddr::V6(_)) => AddressFamily::Ipv6,
+            None => self.family,
+        };
         let servers: Vec<_> = servers
             .into_iter()
             .filter(|server| self.supports_family(server.ip))
@@ -424,10 +478,10 @@ impl RequestSettings {
         options.timeout = self.timeout;
         options.attempts = self.tries.get() - 1;
         options.recursion_desired = true;
-        options.ip_strategy = match (ipv4, ipv6) {
-            (true, _) => LookupIpStrategy::Ipv4Only,
-            (_, true) => LookupIpStrategy::Ipv6Only,
-            _ => LookupIpStrategy::Ipv4AndIpv6,
+        options.ip_strategy = match family {
+            AddressFamily::Ipv4 => LookupIpStrategy::Ipv4Only,
+            AddressFamily::Ipv6 => LookupIpStrategy::Ipv6Only,
+            AddressFamily::Any => LookupIpStrategy::Ipv4AndIpv6,
         };
         options.preserve_intermediates = false;
         options.use_hosts_file = ResolveHosts::Never;
@@ -436,8 +490,7 @@ impl RequestSettings {
     }
 
     pub(crate) fn supports_family(&self, ip: IpAddr) -> bool {
-        (!self.ipv4 || ip.is_ipv4())
-            && (!self.ipv6 || ip.is_ipv6())
+        self.family.supports(ip)
             && self
                 .source
                 .is_none_or(|source| source.is_ipv4() == ip.is_ipv4())

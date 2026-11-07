@@ -156,8 +156,8 @@ impl Document {
             schema_version: 1,
             mode: if trace { Mode::Trace } else { Mode::Lookup },
             query: QuerySummary {
-                name: question.name.to_ascii(),
-                record_type: record_type(question.record_type),
+                name: question.name().to_ascii(),
+                record_type: record_type(question.record_type()),
                 subnet: settings
                     .subnet
                     .map(|subnet| format!("{}/{}", subnet.addr(), subnet.source_prefix())),
@@ -188,10 +188,19 @@ impl Document {
         enriched: EnrichedResponse<'_>,
         hop: Option<usize>,
     ) -> Result<(), Box<dyn Error>> {
+        match self.mode {
+            Mode::Lookup => assert!(hop.is_none(), "lookup responses cannot have hop numbers"),
+            Mode::Trace => assert_eq!(
+                hop,
+                Some(self.responses.len() + 1),
+                "trace hop numbers must be consecutive and start at one"
+            ),
+        }
+
         let response = enriched.response;
-        let message = &response.message;
+        let message = response.message();
         let metadata = &message.metadata;
-        let question = &message.queries[0];
+        let question = response.question();
         let answers = Self::records(enriched.answers)?;
         let authority = Self::records(enriched.authority)?;
         let additional = Self::records(enriched.additional)?;
@@ -270,16 +279,16 @@ impl Document {
         error: Option<&dyn Error>,
         databases: &[Database],
     ) -> Result<(), Box<dyn Error>> {
-        self.complete = error.is_none();
         self.error = error.map(|error| Failure {
             code: "lookup_failed",
             message: error.to_string(),
         });
+        self.complete = self.error.is_none();
         if let Some(enrichment) = &mut self.enrichment {
             enrichment.databases = databases
                 .iter()
                 .map(|database| DatabaseSource {
-                    kind: database.kind,
+                    kind: database.kind(),
                     build_date: database.build_date(),
                 })
                 .collect();
