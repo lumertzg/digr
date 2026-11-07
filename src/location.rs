@@ -27,7 +27,7 @@ pub enum Progress {
     },
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     City,
@@ -62,8 +62,30 @@ impl std::str::FromStr for Kind {
 }
 
 pub struct Database {
-    pub kind: Kind,
+    kind: Kind,
     reader: Reader<Vec<u8>>,
+}
+
+/// Constructed only after acquiring the state-file lock. Kept alive through installation.
+struct InstallLock(File);
+
+impl InstallLock {
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = state_file(path)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self(file))),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = state_file(path)?;
+        file.lock()?;
+
+        Ok(Self(file))
+    }
 }
 
 #[derive(Serialize)]
@@ -110,24 +132,29 @@ impl Database {
             return Ok(Self { kind, reader });
         }
 
-        let lock = state_file(&state_path)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
+        let lock = match InstallLock::try_acquire(&state_path)? {
+            Some(lock) => lock,
+            None => {
                 progress(Progress::Waiting);
-                lock.lock()?;
+                InstallLock::acquire(&state_path)?
             }
-            Err(TryLockError::Error(error)) => return Err(error.into()),
-        }
+        };
 
         // Another first-use process may have installed the database while we waited.
         // A first install is user-requested, so unlike background refreshes it is not rate-limited.
         let reader = match open(&path, kind) {
             Ok(reader) => reader,
-            Err(_) => install(&path, kind, &release_months(None, Utc::now()), progress).await?,
+            Err(_) => {
+                let months = release_months(None, Utc::now());
+                install(&lock, &path, kind, &months, progress).await?
+            }
         };
 
         Ok(Self { kind, reader })
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
     }
 
     pub fn refresh_if_stale(&self) -> Result<()> {
@@ -179,13 +206,9 @@ impl Database {
 
 pub async fn update(kind: Kind) -> Result<()> {
     let (path, state_path) = paths(kind)?;
-    let mut lock = state_file(&state_path)?;
-
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(()),
-        Err(TryLockError::Error(error)) => return Err(error.into()),
-    }
+    let Some(mut lock) = InstallLock::try_acquire(&state_path)? else {
+        return Ok(());
+    };
 
     let installed = open(&path, kind).ok();
     if installed.as_ref().is_some_and(|reader| !stale(reader)) || !begin_attempt(&mut lock)? {
@@ -194,7 +217,7 @@ pub async fn update(kind: Kind) -> Result<()> {
 
     let installed = installed.as_ref().map(release_month);
     let months = release_months(installed.as_deref(), Utc::now());
-    install(&path, kind, &months, |_| {}).await?;
+    install(&lock, &path, kind, &months, |_| {}).await?;
 
     Ok(())
 }
@@ -215,6 +238,7 @@ fn cache_directory() -> Result<PathBuf> {
     Ok(directory)
 }
 
+// Never replace this file. Every process must lock the same inode while databases are replaced.
 fn state_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -258,8 +282,10 @@ fn recent_attempt(value: &str) -> bool {
         .is_some_and(|elapsed| (0..RETRY_INTERVAL).contains(&elapsed))
 }
 
-fn begin_attempt(state: &mut File) -> io::Result<bool> {
+fn begin_attempt(lock: &mut InstallLock) -> io::Result<bool> {
+    let state = &mut lock.0;
     let mut value = String::new();
+    state.rewind()?;
     state.read_to_string(&mut value)?;
     if recent_attempt(&value) {
         return Ok(false);
@@ -324,6 +350,7 @@ fn open(path: &Path, kind: Kind) -> Result<Reader<Vec<u8>>> {
 }
 
 async fn install(
+    _lock: &InstallLock,
     path: &Path,
     kind: Kind,
     months: &[String],

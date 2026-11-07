@@ -7,7 +7,7 @@ use hickory_resolver::proto::rr::{Name, RecordType};
 use ipnet::IpNet;
 use usage_rs::{Cli, Subcommands, ValidationError};
 
-use crate::dns::{Nameserver, Question, RequestSettings};
+use crate::dns::{AddressFamily, Nameserver, Question, RequestSettings};
 use crate::location::Kind;
 
 /// Query DNS records.
@@ -142,11 +142,15 @@ impl TryFrom<QueryArgs> for Command {
     type Error = ValidationError;
 
     fn try_from(args: QueryArgs) -> Result<Self, Self::Error> {
-        let family_matches =
-            |ip: IpAddr| !(args.ipv4 && ip.is_ipv6()) && !(args.ipv6 && ip.is_ipv4());
+        let family = match (args.ipv4, args.ipv6) {
+            (true, false) => AddressFamily::Ipv4,
+            (false, true) => AddressFamily::Ipv6,
+            (false, false) => AddressFamily::Any,
+            (true, true) => unreachable!("usage-rs rejects conflicting transport families"),
+        };
 
         if let Some(source) = args.source
-            && !family_matches(source)
+            && !family.supports(source)
         {
             return Err(ValidationError::field("--source")
                 .value(source.to_string())
@@ -155,7 +159,7 @@ impl TryFrom<QueryArgs> for Command {
 
         if let Some(server) = &args.server {
             validate_server(server, |ip| {
-                family_matches(ip)
+                family.supports(ip)
                     && args
                         .source
                         .is_none_or(|source| source.is_ipv4() == ip.is_ipv4())
@@ -170,7 +174,7 @@ impl TryFrom<QueryArgs> for Command {
             .as_deref()
             .map(parse_record_type)
             .transpose()?;
-        let (mut name, record_type) = match args.reverse {
+        let (name, record_type) = match args.reverse {
             Some(ip) => {
                 if record_type.is_some_and(|kind| kind != RecordType::PTR) {
                     return Err(ValidationError::field("--type")
@@ -185,15 +189,13 @@ impl TryFrom<QueryArgs> for Command {
                 record_type.unwrap_or(RecordType::A),
             ),
         };
-        name.set_fqdn(true);
 
         Ok(Command::Query(QueryOptions {
-            question: Question { name, record_type },
+            question: Question::new(name, record_type),
             settings: RequestSettings {
                 port: args.port,
                 tcp: args.tcp,
-                ipv4: args.ipv4,
-                ipv6: args.ipv6,
+                family,
                 source: args.source,
                 subnet: subnet.map(|net| ClientSubnet::from(net.trunc())),
                 recursion: !args.no_recursion && !args.trace,
@@ -220,7 +222,7 @@ fn validate_server(server: &str, family: impl Fn(IpAddr) -> bool) -> Result<(), 
     };
 
     match Nameserver::parse(server).map_err(|error| invalid(&error.to_string()))? {
-        Some(nameserver) if !family(nameserver.ip) => {
+        Some(nameserver) if !family(nameserver.ip()) => {
             Err(invalid("must match the requested transport family"))
         }
         Some(_) => Ok(()),
