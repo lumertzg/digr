@@ -22,10 +22,18 @@ pub struct Trace<'a> {
     question: &'a Question,
     settings: &'a RequestSettings,
     explicit_start: bool,
-    servers: Vec<Server>,
-    zone: Name,
-    hop: Option<Hop>,
+    state: State,
     work_left: usize,
+}
+
+enum State {
+    Query {
+        servers: Vec<Server>,
+        zone: Name,
+        number: usize,
+    },
+    PendingError(NetError),
+    Done,
 }
 
 const START_HINT: &str = "--trace --server needs a server that answers non-recursive queries, \
@@ -52,45 +60,67 @@ impl<'a> Trace<'a> {
             question,
             settings,
             explicit_start: server.is_some(),
-            servers,
-            zone: Name::root(),
-            hop: None,
+            state: State::Query {
+                servers,
+                zone: Name::root(),
+                number: 1,
+            },
             work_left: 64,
         })
     }
 
     /// Returns error-status responses before reporting their error on the next call.
-    /// Stop iterating after an error.
-    pub async fn next(&mut self) -> Result<Option<&Hop>, NetError> {
-        if let Some(hop) = &self.hop {
-            let message = &hop.response.message;
-            if message.metadata.response_code != ResponseCode::NoError {
-                let mut error = format!(
-                    "trace received {} from {}",
-                    message.metadata.response_code, hop.response.server
-                );
-                if self.is_explicit_start(hop.number) && is_server_failure(message) {
-                    error = format!("{error} ({START_HINT})");
-                }
-                return Err(error.into());
-            }
+    /// Completion or an error ends the walk. Subsequent calls return None.
+    /// Cancelling an in-flight call also ends the walk without a resumable result.
+    pub async fn next(&mut self) -> Result<Option<Hop>, NetError> {
+        let (servers, zone, number) = match std::mem::replace(&mut self.state, State::Done) {
+            State::Query {
+                servers,
+                zone,
+                number,
+            } => (servers, zone, number),
+            State::PendingError(error) => return Err(error),
+            State::Done => return Ok(None),
+        };
+        let response = self.send(&servers, &zone, number).await?;
+        let hop = Hop { number, response };
 
-            if message.metadata.authoritative {
-                return Ok(None);
-            }
+        self.state = self
+            .next_state(&hop, &zone)
+            .unwrap_or_else(State::PendingError);
 
-            if hop.number >= 32 {
-                return Err("trace hop limit exceeded".into());
-            }
+        Ok(Some(hop))
+    }
 
-            let zone = self.referral_zone(message)?.clone();
-            self.servers = self.referral_servers(message, &zone);
-            self.zone = zone;
+    fn next_state(&self, hop: &Hop, zone: &Name) -> Result<State, NetError> {
+        let message = &hop.response.message;
+        if message.metadata.response_code != ResponseCode::NoError {
+            let mut error = format!(
+                "trace received {} from {}",
+                message.metadata.response_code, hop.response.server
+            );
+            if self.is_explicit_start(hop.number) && is_server_failure(message) {
+                error = format!("{error} ({START_HINT})");
+            }
+            return Err(error.into());
         }
 
-        self.hop = Some(self.send().await?);
+        if message.metadata.authoritative {
+            return Ok(State::Done);
+        }
 
-        Ok(self.hop.as_ref())
+        if hop.number >= 32 {
+            return Err("trace hop limit exceeded".into());
+        }
+
+        let next_zone = self.referral_zone(message, zone)?.clone();
+        let servers = self.referral_servers(message, zone, &next_zone);
+
+        Ok(State::Query {
+            servers,
+            zone: next_zone,
+            number: hop.number + 1,
+        })
     }
 
     /// Recursive resolvers fail non-recursive queries, a common mistake with --server.
@@ -98,12 +128,16 @@ impl<'a> Trace<'a> {
         hop == 1 && self.explicit_start
     }
 
-    async fn send(&mut self) -> Result<Hop, NetError> {
+    async fn send(
+        &mut self,
+        servers: &[Server],
+        zone: &Name,
+        number: usize,
+    ) -> Result<Response, NetError> {
         let mut last_error = NetError::from("no nameservers match the requested transport family");
         let mut failure = None;
-        let servers = std::mem::take(&mut self.servers);
 
-        for server in &servers {
+        for server in servers {
             let addresses = match server {
                 Server::Address(address) => vec![*address],
                 Server::Host(name) => {
@@ -139,9 +173,8 @@ impl<'a> Trace<'a> {
                 }
 
                 if response.message.metadata.response_code == ResponseCode::NoError
-                    && let Err(error) = self.validate_response(&response.message)
+                    && let Err(error) = self.validate_response(&response.message, zone)
                 {
-                    let number = self.hop.as_ref().map_or(1, |hop| hop.number + 1);
                     last_error = if self.is_explicit_start(number) {
                         format!("{server}: {error} ({START_HINT})")
                     } else {
@@ -151,23 +184,16 @@ impl<'a> Trace<'a> {
                     continue;
                 }
 
-                return Ok(self.hop(response));
+                return Ok(response);
             }
         }
 
-        failure.map(|response| self.hop(response)).ok_or(last_error)
+        failure.ok_or(last_error)
     }
 
-    fn hop(&self, response: Response) -> Hop {
-        Hop {
-            number: self.hop.as_ref().map_or(1, |hop| hop.number + 1),
-            response,
-        }
-    }
-
-    fn validate_response(&self, response: &DnsResponse) -> Result<(), NetError> {
+    fn validate_response(&self, response: &DnsResponse, zone: &Name) -> Result<(), NetError> {
         if !response.metadata.authoritative {
-            return self.referral_zone(response).map(|_| ());
+            return self.referral_zone(response, zone).map(|_| ());
         }
 
         // Authoritative NODATA ends the walk. A positive answer must concern this query.
@@ -188,7 +214,11 @@ impl<'a> Trace<'a> {
         Ok(())
     }
 
-    fn referral_zone<'r>(&self, response: &'r DnsResponse) -> Result<&'r Name, NetError> {
+    fn referral_zone<'r>(
+        &self,
+        response: &'r DnsResponse,
+        zone: &Name,
+    ) -> Result<&'r Name, NetError> {
         if !response.answers.is_empty() {
             return Err("trace received a non-authoritative answer instead of a referral".into());
         }
@@ -200,15 +230,15 @@ impl<'a> Trace<'a> {
                 record.dns_class == DNSClass::IN
                     && matches!(record.data, RData::NS(_))
                     && record.name.zone_of(&self.question.name)
-                    && self.zone.zone_of(&record.name)
-                    && record.name.num_labels() > self.zone.num_labels()
+                    && zone.zone_of(&record.name)
+                    && record.name.num_labels() > zone.num_labels()
             })
             .max_by_key(|record| record.name.num_labels())
             .map(|record| &record.name)
             .ok_or_else(|| "trace received an invalid or non-progressing referral".into())
     }
 
-    fn referral_servers(&self, response: &DnsResponse, zone: &Name) -> Vec<Server> {
+    fn referral_servers(&self, response: &DnsResponse, parent: &Name, zone: &Name) -> Vec<Server> {
         let mut servers = Vec::new();
 
         for record in &response.authorities {
@@ -222,7 +252,7 @@ impl<'a> Trace<'a> {
             let mut has_glue = false;
 
             // Only trust glue within the zone the referring server is authoritative for.
-            if self.zone.zone_of(&nameserver.0) {
+            if parent.zone_of(&nameserver.0) {
                 for glue in &response.additionals {
                     if glue.dns_class == DNSClass::IN
                         && glue.name == nameserver.0
